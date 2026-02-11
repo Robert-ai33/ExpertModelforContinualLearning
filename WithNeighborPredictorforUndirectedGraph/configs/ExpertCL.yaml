@@ -1,0 +1,32 @@
+# ExpertCL Configuration
+# Expert-based continual learning with neighbor prediction for expert selection
+
+default:
+  # Random seeds
+  seed: [0, 1, 2, 3, 4]
+  
+  # Training
+  epochs: 200
+  valid_epoch: 10
+  lr: 1e-3
+  weight_decay: 5e-4
+  patience: 9999
+  batch_size: 256
+  
+  # GNN Architecture (单层GCN)
+  hidden_dim: 128
+  dropout: 0.5
+  
+  # Expert Parameters
+  num_experts: 5  # 最大专家数量
+  
+  # Two-phase Training
+  cls_epochs: 100  # 分类训练epochs (剩余用于邻居预测训练)
+  
+  # Neighbor Prediction Parameters
+  neighbor_hidden_dim: 128
+  num_neg_samples: 3  # 负采样倍数 (负边数量 = 正边数量 * num_neg_samples)
+  neighbor_topk_offset: 100  # 参数u: 对于有n个邻居的节点，检查top-(n+u)预测
+  
+  # Debug
+  debug: true
