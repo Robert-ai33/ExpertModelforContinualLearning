@@ -1,0 +1,38 @@
+# SpectralClusteringCL Configuration
+# Expert-based continual learning with neighbor prediction + spectral clustering
+
+default:
+  # Random seeds
+  seed: [0, 1, 2, 3, 4]
+
+  # Expert Parameters
+  num_experts: 6  # 最大专家数量
+
+  # MLP Architecture
+  hidden_dim: 256
+
+  # Training epochs (per model per session)
+  neighbor_epochs: 500        # 邻居预测器训练epochs
+  cross_class_epochs: 500     # 跨类别邻居预测器训练epochs
+
+  # Training hyperparameters
+  lr: 1e-3
+  weight_decay: 5e-4
+  batch_size: 256
+
+  # Validation
+  valid_epoch: 10
+  patience: 9999
+
+  # Negative sampling
+  num_neg_samples: 3          # 负样本 = 正样本 × num_neg_samples
+
+  # Inference parameters
+  enable_delete_cross_class: true   # 是否删除跨类别边
+  cross_class_threshold: 0.5  # 跨类别邻居判定阈值
+
+  # Leiden clustering
+  leiden_resolution: 0.1       # Leiden 分辨率参数（越大社区越多）
+
+  # Debug
+  debug: true
