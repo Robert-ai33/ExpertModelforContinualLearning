@@ -1,0 +1,35 @@
+# CommunityExpertCL Configuration
+# Expert-based continual learning for graph data
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5       # denominator for train/valid ratio
+  split_t: 3       # train ratio = t/S
+  split_v: 1       # valid ratio = v/S
+
+  # --- Expert Parameters ---
+  num_experts: 7
+
+  # --- GCN Classifier ---
+  gcn_hidden_dim: 256
+  gcn_dropout: 0.5
+  cls_epochs: 200
+  cls_lr: 0.01
+  cls_weight_decay: 5.0e-4
+
+  # --- Graph MAE ---
+  mae_hidden_dim: 256
+  mae_epochs: 200
+  mae_lr: 1.0e-3
+  mae_weight_decay: 1.0e-4
+  mae_gamma: 2        # scaled cosine error exponent
+
+  # --- Training ---
+  batch_size: 256
+  valid_epoch: 10
+  patience: 9999
+
+  # --- Debug ---
+  debug: true
