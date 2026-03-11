@@ -2,5 +2,4 @@ torch>=2.0
 torch_geometric>=2.4
 numpy
 pyyaml
-leidenalg
-python-igraph
+ogb

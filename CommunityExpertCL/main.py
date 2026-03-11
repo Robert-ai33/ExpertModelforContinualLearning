@@ -6,6 +6,9 @@ Usage:
   python main.py --dataset citeseer --gpu 0
   python main.py --dataset coauthor-cs --gpu 0
   python main.py --dataset amazon-computers --gpu 0
+  python main.py --dataset wikics --gpu 0
+  python main.py --dataset ogbn-arxiv --gpu 0
+  python main.py --dataset ogbn-products --gpu 0
 """
 
 import os
@@ -41,9 +44,27 @@ EXP_SETTINGS = {
         'split_v': 1,
     },
     'amazon-computers': {
-        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7, 8, 9]],
+        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
+        'split_S': 5,
+        'split_t': 1,
+        'split_v': 1,
+    },
+    'wikics': {
+        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
         'split_S': 5,
         'split_t': 3,
+        'split_v': 1,
+    },
+    'ogbn-arxiv': {
+        'class_splits': [[0,1,2,3],[4,5,6,7],[8,9,10,11],[12,13,14,15],[16,17,18,19],[20,21,22,23],[24,25,26,27],[28,29,30,31]],
+        'split_S': 10,
+        'split_t': 2,
+        'split_v': 1,
+    },
+    'ogbn-products': {
+        'class_splits': [[6,7,8,9],[10,11,12,13],[14,15,16,17],[18,19,20,21],[22,23,24,25]],
+        'split_S': 10,
+        'split_t': 1,
         'split_v': 1,
     },
 }

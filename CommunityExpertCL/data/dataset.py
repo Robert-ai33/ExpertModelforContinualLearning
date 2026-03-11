@@ -1,7 +1,7 @@
 """
 Dataset loader for CommunityExpertCL.
-Supports: cora, citeseer, coauthor-cs, amazon-computers (all via PyG).
-All graphs are undirected.
+Supports: cora, citeseer, coauthor-cs, amazon-computers, wikics,
+          ogbn-arxiv, ogbn-products (all via PyG, all undirected).
 """
 
 import heapq
@@ -12,12 +12,21 @@ from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, to_undirected
 from torch.utils.data import Dataset
 
+try:
+    from ogb.nodeproppred import PygNodePropPredDataset
+    OGB_AVAILABLE = True
+except ImportError:
+    OGB_AVAILABLE = False
 
-SUPPORTED_DATASETS = {'cora', 'citeseer', 'coauthor-cs', 'amazon-computers'}
+
+SUPPORTED_DATASETS = {
+    'cora', 'citeseer', 'coauthor-cs', 'amazon-computers',
+    'wikics', 'ogbn-arxiv', 'ogbn-products',
+}
 
 
 class GraphDataset(Dataset):
-    """Undirected graph dataset for community-expert continual learning."""
+    """Undirected graph dataset for expert-based continual learning."""
 
     def __init__(self, dataset, data_path):
         self.dataset = dataset
@@ -44,6 +53,10 @@ class GraphDataset(Dataset):
             return self._load_coauthor()
         elif self.dataset == 'amazon-computers':
             return self._load_amazon()
+        elif self.dataset == 'wikics':
+            return self._load_wikics()
+        elif self.dataset in ('ogbn-arxiv', 'ogbn-products'):
+            return self._load_ogbn()
 
     def _load_planetoid(self):
         from torch_geometric.datasets import Planetoid
@@ -64,8 +77,23 @@ class GraphDataset(Dataset):
         pyg_dataset = Amazon(root=self.data_path, name='Computers')
         return self._process(pyg_dataset[0])
 
+    def _load_wikics(self):
+        from torch_geometric.datasets import WikiCS
+        print("Loading WikiCS from PyG...")
+        pyg_dataset = WikiCS(root=self.data_path)
+        return self._process(pyg_dataset[0])
+
+    def _load_ogbn(self):
+        if not OGB_AVAILABLE:
+            raise ImportError("ogb not installed. Install with: pip install ogb")
+        print(f"Loading OGB dataset: {self.dataset} ...")
+        ogb_dataset = PygNodePropPredDataset(
+            name=self.dataset, root=self.data_path
+        )
+        return self._process(ogb_dataset[0])
+
     def _process(self, data):
-        """Common processing pipeline: undirected, remove isolated, self-loops."""
+        """Common processing: undirected, remove isolated, self-loops, reorder."""
         data.y = data.y.to(torch.long)
         if data.y.dim() > 1:
             data.y = data.y.squeeze(-1)

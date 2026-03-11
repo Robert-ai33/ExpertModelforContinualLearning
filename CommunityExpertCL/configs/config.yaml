@@ -10,7 +10,7 @@ default:
   split_v: 1       # valid ratio = v/S
 
   # --- Expert Parameters ---
-  num_experts: 7
+  num_experts: 8
 
   # --- GCN Classifier ---
   gcn_hidden_dim: 256
@@ -21,10 +21,11 @@ default:
 
   # --- Graph MAE ---
   mae_hidden_dim: 256
-  mae_epochs: 200
+  mae_epochs: 300
   mae_lr: 1.0e-3
   mae_weight_decay: 1.0e-4
   mae_gamma: 2        # scaled cosine error exponent
+  mask_ratio: 0.5     # fraction of dimensions to mask (lambda)
 
   # --- Training ---
   batch_size: 256

@@ -7,16 +7,20 @@ Multi-expert model where each expert contains:
 
 MAE Training (per expert, after freezing GCN):
 - For ALL current-class training nodes:
-  - GCN embedding h_v from ORIGINAL features (frozen GCN, no masking)
-  - Masked aggregation: replace node v with learnable mask_token,
-    neighbors keep original features, aggregate WITH self-loops
-  - Decoder: proj(h_v) + proj(masked_agg_v) -> reconstruct x_v
+  - Partial mask: randomly select λ*dim dimensions (one shared mask per epoch),
+    replace those dimensions of x_v with mask_token values, keep the rest
+  - Compute mean of neighbor features (excluding v)
+  - Concatenate partially masked x_v with neighbor mean
+  - Learnable linear W(2d -> d) + ReLU applied to concatenation
+  - Decoder: Linear -> ReLU -> Linear to reconstruct x_v
 - Loss: scaled cosine error
-- Trainable: mae_decoder + mask_token
+- Trainable: mae_decoder + mae_agg_linear + mask_token
 
-Expert Selection (inference, same process):
-- Each expert masks node with its mask_token, computes reconstruction error
-- Select expert with minimum error
+Expert Selection (inference):
+- Each node independently samples its own mask (λ*dim dimensions)
+- Same node uses same mask across all experts (fair comparison)
+- Different nodes use different masks
+- Select expert with minimum reconstruction error
 
 Node Classification:
 - Use selected expert's GCN (unmasked features) to predict class
@@ -69,29 +73,30 @@ class MAEDecoder(nn.Module):
     """
     Graph Masked Autoencoder decoder.
 
-    Takes GCN embeddings + masked aggregation, reconstructs original features.
+    Maps hidden representation back to original feature space
+    for node feature reconstruction via Linear -> ReLU -> Linear.
     """
 
-    def __init__(self, gcn_hidden_dim, feat_dim):
+    def __init__(self, hidden_dim, output_dim):
         super().__init__()
-        self.proj_center = nn.Linear(gcn_hidden_dim, feat_dim)
-        self.proj_neighbor = nn.Linear(feat_dim, feat_dim)
-        self.output = nn.Linear(feat_dim, feat_dim)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, h_center, neighbor_agg):
-        z = self.proj_center(h_center) + self.proj_neighbor(neighbor_agg)
-        return self.output(F.relu(z))
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
 
 
 class PredictionExpert(nn.Module):
-    """Single expert: classification GCN + MAE decoder + learnable mask token."""
+    """Single expert: classification GCN + MAE decoder + learnable mask token + agg layer."""
 
     def __init__(self, input_dim, gcn_hidden_dim, num_classes, dropout=0.5):
         super().__init__()
         self.gcn = ClassificationGCN(input_dim, gcn_hidden_dim, num_classes, dropout)
-        self.mae_decoder = MAEDecoder(gcn_hidden_dim, input_dim)
+        self.mae_decoder = MAEDecoder(input_dim, input_dim)
         self.mask_token = nn.Parameter(torch.zeros(input_dim))
         nn.init.xavier_uniform_(self.mask_token.unsqueeze(0))
+        self.mae_agg_linear = nn.Linear(2 * input_dim, input_dim)
 
 
 class PredictionModel(nn.Module):
@@ -112,26 +117,37 @@ class PredictionModel(nn.Module):
 # Helpers
 # ======================================================================
 
-def compute_masked_agg(x, edge_index_with_selfloop, mask_token, target_indices, num_nodes):
+def compute_masked_agg(x, edge_index, mask_token, agg_linear,
+                       target_indices, num_nodes, mask_matrix):
     """
-    For each target node v, compute mean aggregation where v's feature is
-    replaced by mask_token, neighbors keep original features, WITH self-loops.
+    Per-node partial-masked aggregation: concat(partially_masked_x_v, neighbor_mean) -> Linear -> ReLU.
 
-    Efficient: agg_masked[v] = agg_original[v] + (mask_token - x[v]) / deg[v]
+    Args:
+        mask_matrix: (num_target, feat_dim) bool tensor, per-node mask.
+
+    For each target node v:
+    1. Partial mask: copy x_v, replace dimensions where mask_matrix[i]=True with mask_token values
+    2. Compute mean of neighbor features (excluding v itself)
+    3. Concatenate partially masked x_v with neighbor_mean
+    4. Apply learnable linear W(2d -> d) + ReLU
     """
-    src, dst = edge_index_with_selfloop[0], edge_index_with_selfloop[1]
+    src, dst = edge_index[0], edge_index[1]
     feat_dim = x.size(1)
 
-    deg = degree(dst, num_nodes).clamp(min=1)
+    non_self = src != dst
+    src_ns, dst_ns = src[non_self], dst[non_self]
+
+    deg = degree(dst_ns, num_nodes).clamp(min=1)
     agg = torch.zeros(num_nodes, feat_dim, device=x.device)
-    agg.index_add_(0, dst, x[src])
-    agg = agg / deg.unsqueeze(1)
+    agg.index_add_(0, dst_ns, x[src_ns])
+    neighbor_mean = agg[target_indices] / deg[target_indices].unsqueeze(1)
 
-    target_agg = agg[target_indices]
-    target_deg = deg[target_indices].unsqueeze(1)
-    masked_agg = target_agg + (mask_token.unsqueeze(0) - x[target_indices]) / target_deg
+    masked_x = x[target_indices].clone()
+    mask_vals = mask_token.unsqueeze(0).expand_as(masked_x)
+    masked_x[mask_matrix] = mask_vals[mask_matrix]
+    concat = torch.cat([masked_x, neighbor_mean], dim=1)
 
-    return masked_agg
+    return F.relu(agg_linear(concat))
 
 
 def scaled_cosine_error(pred, target, gamma=2):
@@ -170,6 +186,7 @@ class CommunityExpertCL:
         self.mae_lr = float(config.get('mae_lr', 1e-3))
         self.mae_wd = float(config.get('mae_weight_decay', 1e-4))
         self.mae_gamma = config.get('mae_gamma', 2)
+        self.mask_ratio = config.get('mask_ratio', 0.5)
 
         self.model = PredictionModel(
             self.input_dim, self.gcn_hidden_dim, self.num_classes,
@@ -340,7 +357,12 @@ class CommunityExpertCL:
             param.requires_grad = True
         expert.mask_token.requires_grad = True
 
-        mae_params = list(expert.mae_decoder.parameters()) + [expert.mask_token]
+        for param in expert.mae_agg_linear.parameters():
+            param.requires_grad = True
+
+        mae_params = (list(expert.mae_decoder.parameters())
+                      + list(expert.mae_agg_linear.parameters())
+                      + [expert.mask_token])
         optimizer = optim.Adam(mae_params, lr=self.mae_lr,
                                weight_decay=self.mae_wd)
         best_val = float('inf')
@@ -349,20 +371,18 @@ class CommunityExpertCL:
         num_nodes = x.size(0)
         curr_train_indices = torch.where(loss_mask)[0]
 
-        with torch.no_grad():
-            h_all = expert.gcn.get_embeddings(x, edge_index)
-
         pbar = tqdm(range(self.mae_epochs), desc=f"S{session_id} MAE")
         for epoch in pbar:
             self.model.train()
             expert.mae_decoder.train()
 
-            masked_agg = compute_masked_agg(
-                x, edge_index, expert.mask_token,
-                curr_train_indices, num_nodes)
+            mask_matrix = self._sample_shared_mask(curr_train_indices.size(0))
 
-            recon = expert.mae_decoder(
-                h_all[curr_train_indices].detach(), masked_agg)
+            masked_agg = compute_masked_agg(
+                x, edge_index, expert.mask_token, expert.mae_agg_linear,
+                curr_train_indices, num_nodes, mask_matrix)
+
+            recon = expert.mae_decoder(masked_agg)
             loss = scaled_cosine_error(
                 recon, x[curr_train_indices], gamma=self.mae_gamma)
 
@@ -392,6 +412,26 @@ class CommunityExpertCL:
                         self.dataset, 'PredictionModel', self.seed)
 
     # ==================== Validation ====================
+
+    def _sample_shared_mask(self, num_target):
+        """Sample one mask and broadcast to all nodes: (num_target, input_dim) bool tensor.
+        All nodes share the same masked dimensions. Used in training and validation."""
+        num_mask = int(self.mask_ratio * self.input_dim)
+        indices = torch.randperm(self.input_dim, device=self.device)[:num_mask]
+        row = torch.zeros(self.input_dim, dtype=torch.bool, device=self.device)
+        row[indices] = True
+        return row.unsqueeze(0).expand(num_target, -1)
+
+    def _sample_pernode_mask(self, num_target):
+        """Sample per-node independent mask: (num_target, input_dim) bool tensor.
+        Each node gets its own random masked dimensions. Used in expert selection."""
+        num_mask = int(self.mask_ratio * self.input_dim)
+        rand = torch.rand(num_target, self.input_dim, device=self.device)
+        _, topk_indices = rand.topk(num_mask, dim=1)
+        mask_matrix = torch.zeros(num_target, self.input_dim,
+                                  dtype=torch.bool, device=self.device)
+        mask_matrix.scatter_(1, topk_indices, True)
+        return mask_matrix
 
     def _freeze_all(self):
         for param in self.model.parameters():
@@ -433,10 +473,12 @@ class CommunityExpertCL:
         valid_t = torch.tensor(valid_indices, device=self.device, dtype=torch.long)
         expert = self.model.experts[expert_id]
 
-        h = expert.gcn.get_embeddings(x, edge_index)
+        mask_matrix = self._sample_shared_mask(valid_t.size(0))
+
         masked_agg = compute_masked_agg(
-            x, edge_index, expert.mask_token, valid_t, num_nodes)
-        recon = expert.mae_decoder(h[valid_t], masked_agg)
+            x, edge_index, expert.mask_token, expert.mae_agg_linear,
+            valid_t, num_nodes, mask_matrix)
+        recon = expert.mae_decoder(masked_agg)
         return scaled_cosine_error(recon, x[valid_t],
                                    gamma=self.mae_gamma).item()
 
@@ -444,7 +486,7 @@ class CommunityExpertCL:
 
     @torch.no_grad()
     def _predict_nodes(self, subgraph, target_nodes):
-        """Expert selection via MAE + GCN classification."""
+        """Expert selection via MAE, then run only selected experts' GCN."""
         self.model.eval()
         x = subgraph['x'].to(self.device)
         edge_index = subgraph['edge_index'].to(self.device)
@@ -454,29 +496,31 @@ class CommunityExpertCL:
         target_t = torch.tensor(target_nodes, device=self.device, dtype=torch.long)
         num_target = target_t.size(0)
 
-        recon_errors = torch.zeros(num_experts, num_target, device=self.device)
-        all_logits = torch.zeros(num_experts, num_target, self.num_classes,
-                                 device=self.device)
+        # Phase 1: MAE expert selection (lightweight, no GCN forward)
+        mask_matrix = self._sample_pernode_mask(num_target)
 
+        recon_errors = torch.zeros(num_experts, num_target, device=self.device)
         for eid in range(num_experts):
             expert = self.model.experts[eid]
-
-            h = expert.gcn.get_embeddings(x, edge_index)
             masked_agg = compute_masked_agg(
-                x, edge_index, expert.mask_token, target_t, num_nodes)
-            recon = expert.mae_decoder(h[target_t], masked_agg)
-
+                x, edge_index, expert.mask_token, expert.mae_agg_linear,
+                target_t, num_nodes, mask_matrix)
+            recon = expert.mae_decoder(masked_agg)
             cos_sim = F.cosine_similarity(recon, x[target_t], dim=1)
             recon_errors[eid] = (1 - cos_sim) ** self.mae_gamma
 
-            logits, _ = expert.gcn(x, edge_index)
-            all_logits[eid] = logits[target_t]
-
         expert_assignments = recon_errors.argmin(dim=0)
+        del recon_errors
 
-        node_idx = torch.arange(num_target, device=self.device)
-        selected_logits = all_logits[expert_assignments, node_idx]
-        predictions = selected_logits.argmax(dim=1)
+        # Phase 2: only run GCN for experts that were actually selected
+        predictions = torch.zeros(num_target, dtype=torch.long, device=self.device)
+        active_experts = torch.unique(expert_assignments)
+
+        for eid in active_experts:
+            mask = (expert_assignments == eid)
+            logits, _ = self.model.experts[eid.item()].gcn(x, edge_index)
+            predictions[mask] = logits[target_t[mask]].argmax(dim=1)
+            del logits
 
         return predictions.cpu(), expert_assignments.cpu()
 
