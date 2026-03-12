@@ -35,7 +35,6 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.utils import degree
 from tqdm import tqdm
 
-from utils import save_checkpoint, load_checkpoint
 
 
 # ======================================================================
@@ -162,13 +161,9 @@ def scaled_cosine_error(pred, target, gamma=2):
 class CommunityExpertCL:
     """Expert-based continual learning model with MAE expert selection."""
 
-    def __init__(self, task_loader, config, checkpoint_path,
-                 dataset, seed, device):
+    def __init__(self, task_loader, config, device):
         self.task_loader = task_loader
         self.config = config
-        self.checkpoint_path = checkpoint_path
-        self.dataset = dataset
-        self.seed = seed
         self.device = device
         self.debug = config.get('debug', False)
 
@@ -288,10 +283,6 @@ class CommunityExpertCL:
         """Train one session's expert: Phase 1 GCN, Phase 2 MAE."""
         expert_id = session_id % self.num_experts
 
-        if session_id > 0:
-            load_checkpoint(self.model, self.checkpoint_path,
-                            self.dataset, 'PredictionModel', self.seed)
-
         x = subgraph['x'].to(self.device)
         edge_index = subgraph['edge_index'].to(self.device)
         labels = subgraph['y'].to(self.device)
@@ -317,6 +308,7 @@ class CommunityExpertCL:
         optimizer = optim.Adam(gcn.parameters(), lr=self.cls_lr,
                                weight_decay=self.cls_wd)
         best_val = float('inf')
+        best_gcn_state = None
         patience_cnt = 0
         valid_ep = self.config.get('valid_epoch', 10)
         patience = self.config.get('patience', 9999)
@@ -336,9 +328,8 @@ class CommunityExpertCL:
                 if val_loss < best_val:
                     best_val = val_loss
                     patience_cnt = 0
-                    save_checkpoint(self.model, optimizer, epoch,
-                                    self.checkpoint_path, self.dataset,
-                                    'PredictionModel', self.seed)
+                    best_gcn_state = {k: v.cpu().clone()
+                                      for k, v in gcn.state_dict().items()}
                 else:
                     patience_cnt += 1
                     if patience_cnt > patience:
@@ -347,8 +338,9 @@ class CommunityExpertCL:
             else:
                 pbar.set_postfix(loss=f'{loss.item():.4f}')
 
-        load_checkpoint(self.model, self.checkpoint_path,
-                        self.dataset, 'PredictionModel', self.seed)
+        if best_gcn_state is not None:
+            gcn.load_state_dict({k: v.to(self.device)
+                                 for k, v in best_gcn_state.items()})
 
         # ========== Phase 2: MAE Decoder + mask_token (frozen GCN) ==========
         self._freeze_all()
@@ -366,6 +358,7 @@ class CommunityExpertCL:
         optimizer = optim.Adam(mae_params, lr=self.mae_lr,
                                weight_decay=self.mae_wd)
         best_val = float('inf')
+        best_mae_state = None
         patience_cnt = 0
 
         num_nodes = x.size(0)
@@ -397,9 +390,13 @@ class CommunityExpertCL:
                 if val_loss < best_val:
                     best_val = val_loss
                     patience_cnt = 0
-                    save_checkpoint(self.model, optimizer, epoch,
-                                    self.checkpoint_path, self.dataset,
-                                    'PredictionModel', self.seed)
+                    best_mae_state = {
+                        'decoder': {k: v.cpu().clone() for k, v
+                                    in expert.mae_decoder.state_dict().items()},
+                        'agg_linear': {k: v.cpu().clone() for k, v
+                                       in expert.mae_agg_linear.state_dict().items()},
+                        'mask_token': expert.mask_token.data.cpu().clone(),
+                    }
                 else:
                     patience_cnt += 1
                     if patience_cnt > patience:
@@ -408,8 +405,12 @@ class CommunityExpertCL:
             else:
                 pbar.set_postfix(loss=f'{loss.item():.4f}')
 
-        load_checkpoint(self.model, self.checkpoint_path,
-                        self.dataset, 'PredictionModel', self.seed)
+        if best_mae_state is not None:
+            expert.mae_decoder.load_state_dict(
+                {k: v.to(self.device) for k, v in best_mae_state['decoder'].items()})
+            expert.mae_agg_linear.load_state_dict(
+                {k: v.to(self.device) for k, v in best_mae_state['agg_linear'].items()})
+            expert.mask_token.data = best_mae_state['mask_token'].to(self.device)
 
     # ==================== Validation ====================
 

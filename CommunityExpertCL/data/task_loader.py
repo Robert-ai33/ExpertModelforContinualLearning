@@ -2,7 +2,7 @@
 Task loader for CommunityExpertCL.
 
 Subgraph construction:
-- Training subgraph: target nodes + ALL external neighbors (any class)
+- Training subgraph: target nodes + external neighbors from seen classes only (current + past)
 - Joint test subgraph: all seen classes, external neighbors restricted to seen classes only
 
 Data splitting per class:
@@ -109,9 +109,11 @@ class TaskLoader:
             else:
                 self.test_idx_joint.append(self.test_idx_joint[-1] + test_idx)
 
-            # Training subgraph: external neighbors from ALL classes
+            cumulative_classes.extend(classes)
+
+            # Training subgraph: external neighbors from seen classes only
             curr_subgraph = self._create_task_subgraph(
-                classes, allowed_external_classes=None
+                classes, allowed_external_classes=list(cumulative_classes)
             )
             self.subgraph_per_task.append(curr_subgraph)
 
@@ -120,8 +122,6 @@ class TaskLoader:
                 classes, allowed_external_classes=[]
             )
             self.subgraph_isolated.append(isolated_subgraph)
-
-            cumulative_classes.extend(classes)
 
             # Joint test subgraph: external neighbors restricted to seen classes
             joint_subgraph = self._create_task_subgraph(

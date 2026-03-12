@@ -1,6 +1,6 @@
 """
 Dataset loader for CommunityExpertCL.
-Supports: cora, citeseer, coauthor-cs, amazon-computers, wikics,
+Supports: cora, citeseer, cora-full, coauthor-cs, amazon-computers, wikics,
           ogbn-arxiv, ogbn-products (all via PyG, all undirected).
 """
 
@@ -20,7 +20,7 @@ except ImportError:
 
 
 SUPPORTED_DATASETS = {
-    'cora', 'citeseer', 'coauthor-cs', 'amazon-computers',
+    'cora', 'citeseer', 'cora-full', 'coauthor-cs', 'amazon-computers',
     'wikics', 'ogbn-arxiv', 'ogbn-products',
 }
 
@@ -49,6 +49,8 @@ class GraphDataset(Dataset):
     def _load_data(self):
         if self.dataset in ('cora', 'citeseer'):
             return self._load_planetoid()
+        elif self.dataset == 'cora-full':
+            return self._load_cora_full()
         elif self.dataset == 'coauthor-cs':
             return self._load_coauthor()
         elif self.dataset == 'amazon-computers':
@@ -63,6 +65,12 @@ class GraphDataset(Dataset):
         name_map = {'cora': 'Cora', 'citeseer': 'CiteSeer'}
         print(f"Loading {self.dataset} from PyG Planetoid...")
         pyg_dataset = Planetoid(root=self.data_path, name=name_map[self.dataset])
+        return self._process(pyg_dataset[0])
+
+    def _load_cora_full(self):
+        from torch_geometric.datasets import CitationFull
+        print("Loading CoraFull from PyG CitationFull...")
+        pyg_dataset = CitationFull(root=self.data_path, name='Cora')
         return self._process(pyg_dataset[0])
 
     def _load_coauthor(self):

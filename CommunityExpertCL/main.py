@@ -8,6 +8,7 @@ Usage:
   python main.py --dataset amazon-computers --gpu 0
   python main.py --dataset wikics --gpu 0
   python main.py --dataset ogbn-arxiv --gpu 0
+  python main.py --dataset cora-full --gpu 0
   python main.py --dataset ogbn-products --gpu 0
 """
 
@@ -37,6 +38,16 @@ EXP_SETTINGS = {
         'split_t': 3,
         'split_v': 1,
     },
+    'cora-full': {
+        'class_splits': [
+            [0,1,2,3,4], [5,6,7,8,9], [10,11,12,13,14],
+            [15,16,17,18,19], [20,21,22,23,24], [25,26,27,28,29],
+            [30,31,32,33,34], [35,36,37,38,39]
+        ],
+        'split_S': 5,
+        'split_t': 2,
+        'split_v': 1,
+    },
     'coauthor-cs': {
         'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11], [12, 13, 14]],
         'split_S': 5,
@@ -46,7 +57,7 @@ EXP_SETTINGS = {
     'amazon-computers': {
         'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
         'split_S': 5,
-        'split_t': 1,
+        'split_t': 2,
         'split_v': 1,
     },
     'wikics': {
@@ -76,7 +87,6 @@ def main():
                         choices=list(EXP_SETTINGS.keys()))
     parser.add_argument('--data_path', type=str, default='./data_files/')
     parser.add_argument('--config_path', type=str, default='./configs/config.yaml')
-    parser.add_argument('--ckpt_path', type=str, default='./checkpoints/')
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
     args = parser.parse_args()
@@ -107,10 +117,6 @@ def main():
     seeds = config.get('seed', [0, 1, 2, 3, 4])
     ntrials = min(args.ntrials, len(seeds))
 
-    # Checkpoint path
-    ckpt_path = os.path.join(args.ckpt_path, args.dataset)
-    os.makedirs(ckpt_path, exist_ok=True)
-
     # Run trials
     all_acc = []
 
@@ -136,9 +142,6 @@ def main():
         model = CommunityExpertCL(
             task_loader=task_loader,
             config=config,
-            checkpoint_path=ckpt_path,
-            dataset=args.dataset,
-            seed=seed,
             device=device,
         )
 
