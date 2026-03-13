@@ -182,6 +182,9 @@ class CommunityExpertCL:
         self.mae_wd = float(config.get('mae_weight_decay', 1e-4))
         self.mae_gamma = config.get('mae_gamma', 2)
         self.mask_ratio = config.get('mask_ratio', 0.5)
+        self.use_dispersion_loss = config.get('use_dispersion_loss', True)
+        self.dispersion_weight = config.get('dispersion_weight', 0.5)
+        self.dispersion_margin = config.get('dispersion_margin', 0.1)
 
         self.model = PredictionModel(
             self.input_dim, self.gcn_hidden_dim, self.num_classes,
@@ -347,10 +350,9 @@ class CommunityExpertCL:
         expert = self.model.experts[expert_id]
         for param in expert.mae_decoder.parameters():
             param.requires_grad = True
-        expert.mask_token.requires_grad = True
-
         for param in expert.mae_agg_linear.parameters():
             param.requires_grad = True
+        expert.mask_token.requires_grad = True
 
         mae_params = (list(expert.mae_decoder.parameters())
                       + list(expert.mae_agg_linear.parameters())
@@ -364,20 +366,39 @@ class CommunityExpertCL:
         num_nodes = x.size(0)
         curr_train_indices = torch.where(loss_mask)[0]
 
+        old_tokens = None
+        if session_id > 0 and self.use_dispersion_loss and self.dispersion_weight > 0:
+            old_expert_ids = sorted(
+                {s % self.num_experts for s in range(session_id)} - {expert_id}
+            )
+            if old_expert_ids:
+                old_tokens_list = [
+                    self.model.experts[eid].mask_token.detach()
+                    for eid in old_expert_ids
+                ]
+                old_tokens = torch.stack(old_tokens_list).to(self.device)
+
         pbar = tqdm(range(self.mae_epochs), desc=f"S{session_id} MAE")
         for epoch in pbar:
             self.model.train()
             expert.mae_decoder.train()
 
             mask_matrix = self._sample_shared_mask(curr_train_indices.size(0))
-
             masked_agg = compute_masked_agg(
                 x, edge_index, expert.mask_token, expert.mae_agg_linear,
                 curr_train_indices, num_nodes, mask_matrix)
-
             recon = expert.mae_decoder(masked_agg)
-            loss = scaled_cosine_error(
+
+            recon_loss = scaled_cosine_error(
                 recon, x[curr_train_indices], gamma=self.mae_gamma)
+
+            dispersion_loss = torch.tensor(0.0, device=self.device)
+            if old_tokens is not None:
+                curr_token = expert.mask_token.unsqueeze(0)
+                cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
+                dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
+
+            loss = recon_loss + self.dispersion_weight * dispersion_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -401,9 +422,14 @@ class CommunityExpertCL:
                     patience_cnt += 1
                     if patience_cnt > patience:
                         break
-                pbar.set_postfix(loss=f'{loss.item():.4f}', val=f'{val_loss:.4f}')
+                pbar.set_postfix(
+                    recon=f'{recon_loss.item():.4f}',
+                    disp=f'{dispersion_loss.item():.4f}',
+                    val=f'{val_loss:.4f}')
             else:
-                pbar.set_postfix(loss=f'{loss.item():.4f}')
+                pbar.set_postfix(
+                    recon=f'{recon_loss.item():.4f}',
+                    disp=f'{dispersion_loss.item():.4f}')
 
         if best_mae_state is not None:
             expert.mae_decoder.load_state_dict(
