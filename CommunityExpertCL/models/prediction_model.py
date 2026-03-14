@@ -20,7 +20,7 @@ Expert Selection (inference):
 - Each node independently samples its own mask (λ*dim dimensions)
 - Same node uses same mask across all experts (fair comparison)
 - Different nodes use different masks
-- Select expert with minimum reconstruction error
+- Select expert with minimum score: scaled_cosine_error + pearson_weight * pearson_loss
 
 Node Classification:
 - Use selected expert's GCN (unmasked features) to predict class
@@ -154,6 +154,27 @@ def scaled_cosine_error(pred, target, gamma=2):
     return ((1 - cos_sim) ** gamma).mean()
 
 
+def pearson_correlation_loss(x, recon, eps=1e-8):
+    """1 - Pearson correlation between x and recon (flattened). Minimizing this maximizes correlation."""
+    x_flat = x.view(-1)
+    recon_flat = recon.view(-1)
+    x_c = x_flat - x_flat.mean()
+    recon_c = recon_flat - recon_flat.mean()
+    pearson = (x_c * recon_c).sum() / (x_c.norm() * recon_c.norm() + eps)
+    return 1 - pearson
+
+
+def pearson_loss_per_node(x, recon, eps=1e-8):
+    """Per-node 1 - Pearson correlation. x, recon: (N, D). Returns (N,) loss."""
+    x_c = x - x.mean(dim=1, keepdim=True)
+    recon_c = recon - recon.mean(dim=1, keepdim=True)
+    dot = (x_c * recon_c).sum(dim=1)
+    norm_x = x_c.norm(dim=1) + eps
+    norm_recon = recon_c.norm(dim=1) + eps
+    pearson = dot / (norm_x * norm_recon)
+    return 1 - pearson
+
+
 # ======================================================================
 # CommunityExpertCL - Main Model
 # ======================================================================
@@ -185,6 +206,7 @@ class CommunityExpertCL:
         self.use_dispersion_loss = config.get('use_dispersion_loss', True)
         self.dispersion_weight = config.get('dispersion_weight', 0.5)
         self.dispersion_margin = config.get('dispersion_margin', 0.1)
+        self.pearson_weight = config.get('pearson_weight', 0.0)
 
         self.model = PredictionModel(
             self.input_dim, self.gcn_hidden_dim, self.num_classes,
@@ -392,13 +414,18 @@ class CommunityExpertCL:
             recon_loss = scaled_cosine_error(
                 recon, x[curr_train_indices], gamma=self.mae_gamma)
 
+            pearson_loss = torch.tensor(0.0, device=self.device)
+            if self.pearson_weight > 0:
+                x_curr = x[curr_train_indices]
+                pearson_loss = pearson_correlation_loss(x_curr, recon)
+
             dispersion_loss = torch.tensor(0.0, device=self.device)
             if old_tokens is not None:
                 curr_token = expert.mask_token.unsqueeze(0)
                 cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
                 dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
 
-            loss = recon_loss + self.dispersion_weight * dispersion_loss
+            loss = recon_loss + self.pearson_weight * pearson_loss + self.dispersion_weight * dispersion_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -424,11 +451,13 @@ class CommunityExpertCL:
                         break
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
+                    pearson=f'{pearson_loss.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}',
                     val=f'{val_loss:.4f}')
             else:
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
+                    pearson=f'{pearson_loss.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}')
 
         if best_mae_state is not None:
@@ -527,14 +556,16 @@ class CommunityExpertCL:
         mask_matrix = self._sample_pernode_mask(num_target)
 
         recon_errors = torch.zeros(num_experts, num_target, device=self.device)
+        x_target = x[target_t]
         for eid in range(num_experts):
             expert = self.model.experts[eid]
             masked_agg = compute_masked_agg(
                 x, edge_index, expert.mask_token, expert.mae_agg_linear,
                 target_t, num_nodes, mask_matrix)
             recon = expert.mae_decoder(masked_agg)
-            cos_sim = F.cosine_similarity(recon, x[target_t], dim=1)
-            recon_errors[eid] = (1 - cos_sim) ** self.mae_gamma
+            scaled_cos = (1 - F.cosine_similarity(recon, x_target, dim=1)) ** self.mae_gamma
+            pearson_loss = pearson_loss_per_node(x_target, recon)
+            recon_errors[eid] = scaled_cos + self.pearson_weight * pearson_loss
 
         expert_assignments = recon_errors.argmin(dim=0)
         del recon_errors
