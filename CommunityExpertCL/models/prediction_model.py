@@ -20,7 +20,7 @@ Expert Selection (inference):
 - Each node independently samples its own mask (λ*dim dimensions)
 - Same node uses same mask across all experts (fair comparison)
 - Different nodes use different masks
-- Select expert with minimum score: scaled_cosine_error + pearson_weight * pearson_loss
+- Select expert with minimum score: scaled_cosine + pearson_weight*pearson + norm_ratio_weight*norm_ratio
 
 Node Classification:
 - Use selected expert's GCN (unmasked features) to predict class
@@ -175,6 +175,22 @@ def pearson_loss_per_node(x, recon, eps=1e-8):
     return 1 - pearson
 
 
+def norm_ratio_loss(x, recon, eps=1e-8):
+    """(log(||recon||+eps) - log(||x||+eps))^2 per sample, then mean. Encourages similar magnitude."""
+    norm_x = x.norm(dim=1) + eps
+    norm_recon = recon.norm(dim=1) + eps
+    log_diff = torch.log(norm_recon) - torch.log(norm_x)
+    return (log_diff ** 2).mean()
+
+
+def norm_ratio_loss_per_node(x, recon, eps=1e-8):
+    """Per-node (log(||recon||+eps) - log(||x||+eps))^2. x, recon: (N, D). Returns (N,) loss."""
+    norm_x = x.norm(dim=1) + eps
+    norm_recon = recon.norm(dim=1) + eps
+    log_diff = torch.log(norm_recon) - torch.log(norm_x)
+    return log_diff ** 2
+
+
 # ======================================================================
 # CommunityExpertCL - Main Model
 # ======================================================================
@@ -207,6 +223,7 @@ class CommunityExpertCL:
         self.dispersion_weight = config.get('dispersion_weight', 0.5)
         self.dispersion_margin = config.get('dispersion_margin', 0.1)
         self.pearson_weight = config.get('pearson_weight', 0.0)
+        self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
 
         self.model = PredictionModel(
             self.input_dim, self.gcn_hidden_dim, self.num_classes,
@@ -419,13 +436,20 @@ class CommunityExpertCL:
                 x_curr = x[curr_train_indices]
                 pearson_loss = pearson_correlation_loss(x_curr, recon)
 
+            norm_ratio_loss_val = torch.tensor(0.0, device=self.device)
+            if self.norm_ratio_weight > 0:
+                x_curr = x[curr_train_indices]
+                norm_ratio_loss_val = norm_ratio_loss(x_curr, recon)
+
             dispersion_loss = torch.tensor(0.0, device=self.device)
             if old_tokens is not None:
                 curr_token = expert.mask_token.unsqueeze(0)
                 cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
                 dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
 
-            loss = recon_loss + self.pearson_weight * pearson_loss + self.dispersion_weight * dispersion_loss
+            loss = (recon_loss + self.pearson_weight * pearson_loss
+                   + self.norm_ratio_weight * norm_ratio_loss_val
+                   + self.dispersion_weight * dispersion_loss)
 
             optimizer.zero_grad()
             loss.backward()
@@ -452,12 +476,14 @@ class CommunityExpertCL:
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
                     pearson=f'{pearson_loss.item():.4f}',
+                    norm=f'{norm_ratio_loss_val.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}',
                     val=f'{val_loss:.4f}')
             else:
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
                     pearson=f'{pearson_loss.item():.4f}',
+                    norm=f'{norm_ratio_loss_val.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}')
 
         if best_mae_state is not None:
@@ -565,7 +591,9 @@ class CommunityExpertCL:
             recon = expert.mae_decoder(masked_agg)
             scaled_cos = (1 - F.cosine_similarity(recon, x_target, dim=1)) ** self.mae_gamma
             pearson_loss = pearson_loss_per_node(x_target, recon)
-            recon_errors[eid] = scaled_cos + self.pearson_weight * pearson_loss
+            norm_ratio = norm_ratio_loss_per_node(x_target, recon)
+            recon_errors[eid] = (scaled_cos + self.pearson_weight * pearson_loss
+                                + self.norm_ratio_weight * norm_ratio)
 
         expert_assignments = recon_errors.argmin(dim=0)
         del recon_errors

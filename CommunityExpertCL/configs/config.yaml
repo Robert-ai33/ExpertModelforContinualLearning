@@ -26,9 +26,10 @@ default:
   mae_weight_decay: 1.0e-4
   mae_gamma: 2        # scaled cosine error exponent
   mask_ratio: 0.7     # fraction of dimensions to mask (lambda)
-  pearson_weight: 0.3 # weight for 1-Pearson correlation loss (0 to disable)
-  use_dispersion_loss: false   # whether to use mask_token dispersion loss
-  dispersion_weight: 0.5      # weight for mask_token dispersion loss
+  pearson_weight: 0.5 # weight for 1-Pearson correlation loss (0 to disable)
+  norm_ratio_weight: 0.3  # weight for (log(||recon||)-log(||x||))^2 loss (0 to disable)
+  use_dispersion_loss: true   # whether to use mask_token dispersion loss
+  dispersion_weight: 0.1      # weight for mask_token dispersion loss
   dispersion_margin: 0.1       # max allowed cosine sim with old tokens
 
   # --- Training ---
