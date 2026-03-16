@@ -1,0 +1,29 @@
+# MAS (Memory Aware Synapses) Configuration
+# Regularization-based CL: importance = output sensitivity to parameter changes
+# Loss = CE + mas_lambda * sum_i Omega_i * (theta_i - theta*_i)^2
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- GCN Classifier ---
+  gcn_hidden_dim: 256
+  gcn_dropout: 0.5
+  cls_epochs: 200
+  cls_lr: 0.01
+  cls_weight_decay: 5.0e-4
+
+  # --- MAS Parameters ---
+  mas_lambda: 1.0    # regularization strength
+
+  # --- Training ---
+  batch_size: 256
+  valid_epoch: 10
+  patience: 9999
+
+  # --- Debug ---
+  debug: true

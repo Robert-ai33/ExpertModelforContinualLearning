@@ -3,13 +3,14 @@ CommunityExpertCL - Main entry point.
 
 Usage:
   python main.py --dataset cora --gpu 0
-  python main.py --dataset citeseer --gpu 0
-  python main.py --dataset coauthor-cs --gpu 0
-  python main.py --dataset amazon-computers --gpu 0
-  python main.py --dataset wikics --gpu 0
-  python main.py --dataset ogbn-arxiv --gpu 0
-  python main.py --dataset cora-full --gpu 0
-  python main.py --dataset ogbn-products --gpu 0
+  python main.py --dataset cora --model bare --config_path ./configs/config_bare.yaml
+  python main.py --dataset cora --model ewc  --config_path ./configs/config_ewc.yaml
+  python main.py --dataset cora --model mas  --config_path ./configs/config_mas.yaml
+  python main.py --dataset cora --model gem  --config_path ./configs/config_gem.yaml
+  python main.py --dataset cora --model twp  --config_path ./configs/config_twp.yaml
+  python main.py --dataset cora --model lwf  --config_path ./configs/config_lwf.yaml
+  python main.py --dataset cora --model joint --config_path ./configs/config_joint.yaml
+  python main.py --dataset coauthor-cs --gpu 0 --amp
 """
 
 import os
@@ -21,6 +22,7 @@ import torch
 
 from data import GraphDataset, TaskLoader
 from models import CommunityExpertCL
+from models.baselines import BASELINE_MODELS
 from utils import seed_everything
 
 
@@ -89,6 +91,11 @@ def main():
     parser.add_argument('--config_path', type=str, default='./configs/config.yaml')
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--model', type=str, default='expert',
+                        choices=['expert'] + list(BASELINE_MODELS.keys()),
+                        help='Model to use (default: expert)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable mixed precision training (AMP)')
     args = parser.parse_args()
 
     # Load config
@@ -102,16 +109,19 @@ def main():
     config['split_S'] = exp.get('split_S', config.get('split_S', 5))
     config['split_t'] = exp.get('split_t', config.get('split_t', 3))
     config['split_v'] = exp.get('split_v', config.get('split_v', 1))
+    config['use_amp'] = args.amp
 
     # Device
     device = torch.device(
         f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     )
     print(f"Device: {device}")
+    print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}")
     print(f"Class splits: {config['class_splits']}")
     print(f"Split ratio: t/S={config['split_t']}/{config['split_S']}, "
           f"v/S={config['split_v']}/{config['split_S']}")
+    print(f"AMP: {'enabled' if args.amp else 'disabled'}")
 
     # Seeds
     seeds = config.get('seed', [0, 1, 2, 3, 4])
@@ -139,11 +149,19 @@ def main():
             split_v=config['split_v'],
         )
 
-        model = CommunityExpertCL(
-            task_loader=task_loader,
-            config=config,
-            device=device,
-        )
+        if args.model == 'expert':
+            model = CommunityExpertCL(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+            )
+        else:
+            model_cls = BASELINE_MODELS[args.model]
+            model = model_cls(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+            )
 
         results = model.fit(trial)
 

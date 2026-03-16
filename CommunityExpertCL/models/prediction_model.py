@@ -13,14 +13,14 @@ MAE Training (per expert, after freezing GCN):
   - Concatenate partially masked x_v with neighbor mean
   - Learnable linear W(2d -> d) + ReLU applied to concatenation
   - Decoder: Linear -> ReLU -> Linear to reconstruct x_v
-- Loss: scaled cosine error
+- Loss: scaled_cosine_error + pearson_weight*pearson + norm_ratio_weight*norm_ratio
 - Trainable: mae_decoder + mae_agg_linear + mask_token
 
 Expert Selection (inference):
 - Each node independently samples its own mask (λ*dim dimensions)
 - Same node uses same mask across all experts (fair comparison)
 - Different nodes use different masks
-- Select expert with minimum score: scaled_cosine + pearson_weight*pearson + norm_ratio_weight*norm_ratio
+- Select expert with minimum per-node scaled_cosine + pearson + norm_ratio
 
 Node Classification:
 - Use selected expert's GCN (unmasked features) to predict class
@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import degree
@@ -150,12 +151,19 @@ def compute_masked_agg(x, edge_index, mask_token, agg_linear,
 
 
 def scaled_cosine_error(pred, target, gamma=2):
+    """(1 - cosine_similarity)^gamma, averaged over samples."""
     cos_sim = F.cosine_similarity(pred, target, dim=1)
     return ((1 - cos_sim) ** gamma).mean()
 
 
+def scaled_cosine_error_per_node(pred, target, gamma=2):
+    """Per-node (1 - cosine_similarity)^gamma. Returns (N,) loss."""
+    cos_sim = F.cosine_similarity(pred, target, dim=1)
+    return (1 - cos_sim) ** gamma
+
+
 def pearson_correlation_loss(x, recon, eps=1e-8):
-    """1 - Pearson correlation between x and recon (flattened). Minimizing this maximizes correlation."""
+    """1 - Pearson correlation between x and recon (flattened)."""
     x_flat = x.view(-1)
     recon_flat = recon.view(-1)
     x_c = x_flat - x_flat.mean()
@@ -176,7 +184,7 @@ def pearson_loss_per_node(x, recon, eps=1e-8):
 
 
 def norm_ratio_loss(x, recon, eps=1e-8):
-    """(log(||recon||+eps) - log(||x||+eps))^2 per sample, then mean. Encourages similar magnitude."""
+    """(log(||recon||+eps) - log(||x||+eps))^2 per sample, then mean."""
     norm_x = x.norm(dim=1) + eps
     norm_recon = recon.norm(dim=1) + eps
     log_diff = torch.log(norm_recon) - torch.log(norm_x)
@@ -184,7 +192,7 @@ def norm_ratio_loss(x, recon, eps=1e-8):
 
 
 def norm_ratio_loss_per_node(x, recon, eps=1e-8):
-    """Per-node (log(||recon||+eps) - log(||x||+eps))^2. x, recon: (N, D). Returns (N,) loss."""
+    """Per-node (log(||recon||+eps) - log(||x||+eps))^2. Returns (N,) loss."""
     norm_x = x.norm(dim=1) + eps
     norm_recon = recon.norm(dim=1) + eps
     log_diff = torch.log(norm_recon) - torch.log(norm_x)
@@ -217,13 +225,16 @@ class CommunityExpertCL:
         self.mae_epochs = config.get('mae_epochs', 200)
         self.mae_lr = float(config.get('mae_lr', 1e-3))
         self.mae_wd = float(config.get('mae_weight_decay', 1e-4))
-        self.mae_gamma = config.get('mae_gamma', 2)
         self.mask_ratio = config.get('mask_ratio', 0.5)
+        self.mae_gamma = config.get('mae_gamma', 2)
+        self.pearson_weight = config.get('pearson_weight', 0.0)
+        self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
         self.use_dispersion_loss = config.get('use_dispersion_loss', True)
         self.dispersion_weight = config.get('dispersion_weight', 0.5)
         self.dispersion_margin = config.get('dispersion_margin', 0.1)
-        self.pearson_weight = config.get('pearson_weight', 0.0)
-        self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
+
+        self.use_amp = config.get('use_amp', False)
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         self.model = PredictionModel(
             self.input_dim, self.gcn_hidden_dim, self.num_classes,
@@ -359,10 +370,12 @@ class CommunityExpertCL:
         for epoch in pbar:
             self.model.train()
             optimizer.zero_grad()
-            logits, _ = gcn(x, edge_index)
-            loss = F.cross_entropy(logits[loss_mask], labels[loss_mask])
-            loss.backward()
-            optimizer.step()
+            with autocast(enabled=self.use_amp):
+                logits, _ = gcn(x, edge_index)
+                loss = F.cross_entropy(logits[loss_mask], labels[loss_mask])
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
 
             if epoch > 0 and epoch % valid_ep == 0:
                 val_loss = self._validate_cls(gcn, x, edge_index, labels,
@@ -423,37 +436,38 @@ class CommunityExpertCL:
             expert.mae_decoder.train()
 
             mask_matrix = self._sample_shared_mask(curr_train_indices.size(0))
-            masked_agg = compute_masked_agg(
-                x, edge_index, expert.mask_token, expert.mae_agg_linear,
-                curr_train_indices, num_nodes, mask_matrix)
-            recon = expert.mae_decoder(masked_agg)
-
-            recon_loss = scaled_cosine_error(
-                recon, x[curr_train_indices], gamma=self.mae_gamma)
-
-            pearson_loss = torch.tensor(0.0, device=self.device)
-            if self.pearson_weight > 0:
+            with autocast(enabled=self.use_amp):
+                masked_agg = compute_masked_agg(
+                    x, edge_index, expert.mask_token, expert.mae_agg_linear,
+                    curr_train_indices, num_nodes, mask_matrix)
+                recon = expert.mae_decoder(masked_agg)
                 x_curr = x[curr_train_indices]
-                pearson_loss = pearson_correlation_loss(x_curr, recon)
 
-            norm_ratio_loss_val = torch.tensor(0.0, device=self.device)
-            if self.norm_ratio_weight > 0:
-                x_curr = x[curr_train_indices]
-                norm_ratio_loss_val = norm_ratio_loss(x_curr, recon)
+                recon_loss = scaled_cosine_error(
+                    recon, x_curr, gamma=self.mae_gamma)
 
-            dispersion_loss = torch.tensor(0.0, device=self.device)
-            if old_tokens is not None:
-                curr_token = expert.mask_token.unsqueeze(0)
-                cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
-                dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
+                pearson_loss_val = torch.tensor(0.0, device=self.device)
+                if self.pearson_weight > 0:
+                    pearson_loss_val = pearson_correlation_loss(x_curr, recon)
 
-            loss = (recon_loss + self.pearson_weight * pearson_loss
-                   + self.norm_ratio_weight * norm_ratio_loss_val
-                   + self.dispersion_weight * dispersion_loss)
+                norm_ratio_loss_val = torch.tensor(0.0, device=self.device)
+                if self.norm_ratio_weight > 0:
+                    norm_ratio_loss_val = norm_ratio_loss(x_curr, recon)
+
+                dispersion_loss = torch.tensor(0.0, device=self.device)
+                if old_tokens is not None:
+                    curr_token = expert.mask_token.unsqueeze(0)
+                    cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
+                    dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
+
+                loss = (recon_loss + self.pearson_weight * pearson_loss_val
+                       + self.norm_ratio_weight * norm_ratio_loss_val
+                       + self.dispersion_weight * dispersion_loss)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
 
             if epoch > 0 and epoch % valid_ep == 0:
                 val_loss = self._validate_mae(
@@ -475,14 +489,14 @@ class CommunityExpertCL:
                         break
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
-                    pearson=f'{pearson_loss.item():.4f}',
+                    pearson=f'{pearson_loss_val.item():.4f}',
                     norm=f'{norm_ratio_loss_val.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}',
                     val=f'{val_loss:.4f}')
             else:
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
-                    pearson=f'{pearson_loss.item():.4f}',
+                    pearson=f'{pearson_loss_val.item():.4f}',
                     norm=f'{norm_ratio_loss_val.item():.4f}',
                     disp=f'{dispersion_loss.item():.4f}')
 
@@ -536,8 +550,10 @@ class CommunityExpertCL:
         if val_loss_mask.sum() == 0:
             return float('inf')
 
-        logits, _ = gcn(x, edge_index)
-        return F.cross_entropy(logits[val_loss_mask], labels[val_loss_mask]).item()
+        with autocast(enabled=self.use_amp):
+            logits, _ = gcn(x, edge_index)
+            val_loss = F.cross_entropy(logits[val_loss_mask], labels[val_loss_mask])
+        return val_loss.item()
 
     @torch.no_grad()
     def _validate_mae(self, expert_id, x, edge_index, valid_idx,
@@ -557,18 +573,42 @@ class CommunityExpertCL:
 
         mask_matrix = self._sample_shared_mask(valid_t.size(0))
 
-        masked_agg = compute_masked_agg(
-            x, edge_index, expert.mask_token, expert.mae_agg_linear,
-            valid_t, num_nodes, mask_matrix)
-        recon = expert.mae_decoder(masked_agg)
-        return scaled_cosine_error(recon, x[valid_t],
-                                   gamma=self.mae_gamma).item()
+        with autocast(enabled=self.use_amp):
+            masked_agg = compute_masked_agg(
+                x, edge_index, expert.mask_token, expert.mae_agg_linear,
+                valid_t, num_nodes, mask_matrix)
+            recon = expert.mae_decoder(masked_agg)
+            x_val = x[valid_t]
+
+            val_loss = scaled_cosine_error(recon, x_val, gamma=self.mae_gamma)
+
+            if self.pearson_weight > 0:
+                val_loss = val_loss + self.pearson_weight * pearson_correlation_loss(x_val, recon)
+
+            if self.norm_ratio_weight > 0:
+                val_loss = val_loss + self.norm_ratio_weight * norm_ratio_loss(x_val, recon)
+
+            if (self.current_session > 0 and self.use_dispersion_loss
+                    and self.dispersion_weight > 0):
+                old_expert_ids = sorted(
+                    {s % self.num_experts for s in range(self.current_session)}
+                    - {expert_id})
+                if old_expert_ids:
+                    old_tokens = torch.stack([
+                        self.model.experts[eid].mask_token.detach()
+                        for eid in old_expert_ids
+                    ]).to(self.device)
+                    curr_token = expert.mask_token.unsqueeze(0)
+                    cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
+                    disp = F.relu(cos_sims - self.dispersion_margin).mean()
+                    val_loss = val_loss + self.dispersion_weight * disp
+        return val_loss.item()
 
     # ==================== Inference ====================
 
     @torch.no_grad()
     def _predict_nodes(self, subgraph, target_nodes):
-        """Expert selection via MAE, then run only selected experts' GCN."""
+        """Expert selection via MAE (batched), then run only selected experts' GCN."""
         self.model.eval()
         x = subgraph['x'].to(self.device)
         edge_index = subgraph['edge_index'].to(self.device)
@@ -577,26 +617,20 @@ class CommunityExpertCL:
         num_experts = min(self.num_experts, self.current_session + 1)
         target_t = torch.tensor(target_nodes, device=self.device, dtype=torch.long)
         num_target = target_t.size(0)
+        infer_batch = self.config.get('infer_batch_size', 0)
 
-        # Phase 1: MAE expert selection (lightweight, no GCN forward)
-        mask_matrix = self._sample_pernode_mask(num_target)
+        # Phase 1: MAE expert selection (batched to save memory)
+        expert_assignments = torch.zeros(num_target, dtype=torch.long, device=self.device)
 
-        recon_errors = torch.zeros(num_experts, num_target, device=self.device)
-        x_target = x[target_t]
-        for eid in range(num_experts):
-            expert = self.model.experts[eid]
-            masked_agg = compute_masked_agg(
-                x, edge_index, expert.mask_token, expert.mae_agg_linear,
-                target_t, num_nodes, mask_matrix)
-            recon = expert.mae_decoder(masked_agg)
-            scaled_cos = (1 - F.cosine_similarity(recon, x_target, dim=1)) ** self.mae_gamma
-            pearson_loss = pearson_loss_per_node(x_target, recon)
-            norm_ratio = norm_ratio_loss_per_node(x_target, recon)
-            recon_errors[eid] = (scaled_cos + self.pearson_weight * pearson_loss
-                                + self.norm_ratio_weight * norm_ratio)
-
-        expert_assignments = recon_errors.argmin(dim=0)
-        del recon_errors
+        if infer_batch <= 0 or infer_batch >= num_target:
+            expert_assignments = self._select_experts_batch(
+                x, edge_index, target_t, num_nodes, num_experts)
+        else:
+            for start in range(0, num_target, infer_batch):
+                end = min(start + infer_batch, num_target)
+                batch_targets = target_t[start:end]
+                expert_assignments[start:end] = self._select_experts_batch(
+                    x, edge_index, batch_targets, num_nodes, num_experts)
 
         # Phase 2: only run GCN for experts that were actually selected
         predictions = torch.zeros(num_target, dtype=torch.long, device=self.device)
@@ -604,11 +638,38 @@ class CommunityExpertCL:
 
         for eid in active_experts:
             mask = (expert_assignments == eid)
-            logits, _ = self.model.experts[eid.item()].gcn(x, edge_index)
+            with autocast(enabled=self.use_amp):
+                logits, _ = self.model.experts[eid.item()].gcn(x, edge_index)
             predictions[mask] = logits[target_t[mask]].argmax(dim=1)
             del logits
 
         return predictions.cpu(), expert_assignments.cpu()
+
+    @torch.no_grad()
+    def _select_experts_batch(self, x, edge_index, batch_targets, num_nodes, num_experts):
+        """Select best expert for a batch of target nodes via MAE reconstruction error."""
+        num_batch = batch_targets.size(0)
+        mask_matrix = self._sample_pernode_mask(num_batch)
+
+        recon_errors = torch.zeros(num_experts, num_batch, device=self.device)
+        x_batch = x[batch_targets]
+        for eid in range(num_experts):
+            expert = self.model.experts[eid]
+            with autocast(enabled=self.use_amp):
+                masked_agg = compute_masked_agg(
+                    x, edge_index, expert.mask_token, expert.mae_agg_linear,
+                    batch_targets, num_nodes, mask_matrix)
+                recon = expert.mae_decoder(masked_agg)
+                scaled_cos = scaled_cosine_error_per_node(
+                    recon, x_batch, gamma=self.mae_gamma)
+                pearson = pearson_loss_per_node(x_batch, recon)
+                norm_ratio = norm_ratio_loss_per_node(x_batch, recon)
+            recon_errors[eid] = (scaled_cos + self.pearson_weight * pearson
+                                + self.norm_ratio_weight * norm_ratio)
+
+        assignments = recon_errors.argmin(dim=0)
+        del recon_errors
+        return assignments
 
     # ==================== Evaluation ====================
 

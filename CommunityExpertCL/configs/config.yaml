@@ -21,14 +21,14 @@ default:
 
   # --- Graph MAE ---
   mae_hidden_dim: 256
-  mae_epochs: 300
+  mae_epochs: 200
   mae_lr: 1.0e-3
   mae_weight_decay: 1.0e-4
+  mask_ratio: 0.4     # fraction of dimensions to mask (lambda)
   mae_gamma: 2        # scaled cosine error exponent
-  mask_ratio: 0.7     # fraction of dimensions to mask (lambda)
   pearson_weight: 0.5 # weight for 1-Pearson correlation loss (0 to disable)
   norm_ratio_weight: 0.3  # weight for (log(||recon||)-log(||x||))^2 loss (0 to disable)
-  use_dispersion_loss: true   # whether to use mask_token dispersion loss
+  use_dispersion_loss: false   # whether to use mask_token dispersion loss
   dispersion_weight: 0.1      # weight for mask_token dispersion loss
   dispersion_margin: 0.1       # max allowed cosine sim with old tokens
 
@@ -36,6 +36,7 @@ default:
   batch_size: 256
   valid_epoch: 10
   patience: 9999
+  infer_batch_size: 4096  # inference batch size for expert selection (0 = no batching)
 
   # --- Debug ---
   debug: true
