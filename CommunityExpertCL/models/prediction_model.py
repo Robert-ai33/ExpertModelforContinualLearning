@@ -229,10 +229,6 @@ class CommunityExpertCL:
         self.mae_gamma = config.get('mae_gamma', 2)
         self.pearson_weight = config.get('pearson_weight', 0.0)
         self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
-        self.use_dispersion_loss = config.get('use_dispersion_loss', True)
-        self.dispersion_weight = config.get('dispersion_weight', 0.5)
-        self.dispersion_margin = config.get('dispersion_margin', 0.1)
-
         self.use_amp = config.get('use_amp', False)
         self.scaler = GradScaler(enabled=self.use_amp)
 
@@ -418,18 +414,6 @@ class CommunityExpertCL:
         num_nodes = x.size(0)
         curr_train_indices = torch.where(loss_mask)[0]
 
-        old_tokens = None
-        if session_id > 0 and self.use_dispersion_loss and self.dispersion_weight > 0:
-            old_expert_ids = sorted(
-                {s % self.num_experts for s in range(session_id)} - {expert_id}
-            )
-            if old_expert_ids:
-                old_tokens_list = [
-                    self.model.experts[eid].mask_token.detach()
-                    for eid in old_expert_ids
-                ]
-                old_tokens = torch.stack(old_tokens_list).to(self.device)
-
         pbar = tqdm(range(self.mae_epochs), desc=f"S{session_id} MAE")
         for epoch in pbar:
             self.model.train()
@@ -454,15 +438,8 @@ class CommunityExpertCL:
                 if self.norm_ratio_weight > 0:
                     norm_ratio_loss_val = norm_ratio_loss(x_curr, recon)
 
-                dispersion_loss = torch.tensor(0.0, device=self.device)
-                if old_tokens is not None:
-                    curr_token = expert.mask_token.unsqueeze(0)
-                    cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
-                    dispersion_loss = F.relu(cos_sims - self.dispersion_margin).mean()
-
                 loss = (recon_loss + self.pearson_weight * pearson_loss_val
-                       + self.norm_ratio_weight * norm_ratio_loss_val
-                       + self.dispersion_weight * dispersion_loss)
+                       + self.norm_ratio_weight * norm_ratio_loss_val)
 
             optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -491,14 +468,12 @@ class CommunityExpertCL:
                     recon=f'{recon_loss.item():.4f}',
                     pearson=f'{pearson_loss_val.item():.4f}',
                     norm=f'{norm_ratio_loss_val.item():.4f}',
-                    disp=f'{dispersion_loss.item():.4f}',
                     val=f'{val_loss:.4f}')
             else:
                 pbar.set_postfix(
                     recon=f'{recon_loss.item():.4f}',
                     pearson=f'{pearson_loss_val.item():.4f}',
-                    norm=f'{norm_ratio_loss_val.item():.4f}',
-                    disp=f'{dispersion_loss.item():.4f}')
+                    norm=f'{norm_ratio_loss_val.item():.4f}')
 
         if best_mae_state is not None:
             expert.mae_decoder.load_state_dict(
@@ -588,20 +563,6 @@ class CommunityExpertCL:
             if self.norm_ratio_weight > 0:
                 val_loss = val_loss + self.norm_ratio_weight * norm_ratio_loss(x_val, recon)
 
-            if (self.current_session > 0 and self.use_dispersion_loss
-                    and self.dispersion_weight > 0):
-                old_expert_ids = sorted(
-                    {s % self.num_experts for s in range(self.current_session)}
-                    - {expert_id})
-                if old_expert_ids:
-                    old_tokens = torch.stack([
-                        self.model.experts[eid].mask_token.detach()
-                        for eid in old_expert_ids
-                    ]).to(self.device)
-                    curr_token = expert.mask_token.unsqueeze(0)
-                    cos_sims = F.cosine_similarity(curr_token, old_tokens, dim=1)
-                    disp = F.relu(cos_sims - self.dispersion_margin).mean()
-                    val_loss = val_loss + self.dispersion_weight * disp
         return val_loss.item()
 
     # ==================== Inference ====================

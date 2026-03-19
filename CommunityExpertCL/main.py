@@ -3,14 +3,8 @@ CommunityExpertCL - Main entry point.
 
 Usage:
   python main.py --dataset cora --gpu 0
-  python main.py --dataset cora --model bare --config_path ./configs/config_bare.yaml
-  python main.py --dataset cora --model ewc  --config_path ./configs/config_ewc.yaml
-  python main.py --dataset cora --model mas  --config_path ./configs/config_mas.yaml
-  python main.py --dataset cora --model gem  --config_path ./configs/config_gem.yaml
-  python main.py --dataset cora --model twp  --config_path ./configs/config_twp.yaml
-  python main.py --dataset cora --model lwf  --config_path ./configs/config_lwf.yaml
-  python main.py --dataset cora --model joint --config_path ./configs/config_joint.yaml
   python main.py --dataset coauthor-cs --gpu 0 --amp
+  python main.py --dataset cora --model lite --config_path ./configs/config_lite.yaml
 """
 
 import os
@@ -21,8 +15,7 @@ import numpy as np
 import torch
 
 from data import GraphDataset, TaskLoader
-from models import CommunityExpertCL
-from models.baselines import BASELINE_MODELS
+from models import CommunityExpertCL, LiteExpertCL
 from utils import seed_everything
 
 
@@ -57,7 +50,7 @@ EXP_SETTINGS = {
         'split_v': 1,
     },
     'amazon-computers': {
-        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
+        'class_splits': [[0, 1], [6, 7], [2, 3], [4, 5], [8, 9]],
         'split_S': 5,
         'split_t': 1,
         'split_v': 1,
@@ -89,11 +82,11 @@ def main():
                         choices=list(EXP_SETTINGS.keys()))
     parser.add_argument('--data_path', type=str, default='./data_files/')
     parser.add_argument('--config_path', type=str, default='./configs/config.yaml')
+    parser.add_argument('--model', type=str, default='expert',
+                        choices=['expert', 'lite'],
+                        help='Model type: expert (CommunityExpertCL) or lite (LiteExpertCL)')
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--model', type=str, default='expert',
-                        choices=['expert'] + list(BASELINE_MODELS.keys()),
-                        help='Model to use (default: expert)')
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed precision training (AMP)')
     args = parser.parse_args()
@@ -116,11 +109,11 @@ def main():
         f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     )
     print(f"Device: {device}")
-    print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}")
     print(f"Class splits: {config['class_splits']}")
     print(f"Split ratio: t/S={config['split_t']}/{config['split_S']}, "
           f"v/S={config['split_v']}/{config['split_S']}")
+    print(f"Model: {args.model}")
     print(f"AMP: {'enabled' if args.amp else 'disabled'}")
 
     # Seeds
@@ -149,19 +142,12 @@ def main():
             split_v=config['split_v'],
         )
 
-        if args.model == 'expert':
-            model = CommunityExpertCL(
-                task_loader=task_loader,
-                config=config,
-                device=device,
-            )
-        else:
-            model_cls = BASELINE_MODELS[args.model]
-            model = model_cls(
-                task_loader=task_loader,
-                config=config,
-                device=device,
-            )
+        ModelClass = LiteExpertCL if args.model == 'lite' else CommunityExpertCL
+        model = ModelClass(
+            task_loader=task_loader,
+            config=config,
+            device=device,
+        )
 
         results = model.fit(trial)
 

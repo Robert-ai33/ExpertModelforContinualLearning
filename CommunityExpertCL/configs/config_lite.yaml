@@ -1,0 +1,50 @@
+# LiteExpertCL Configuration
+# Lightweight expert model with parameter-free GCN
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- Expert Parameters ---
+  max_experts: 4            # merge when reaching this capacity
+
+  # --- Parameter-free GCN ---
+  gcn_layers: 1           # number of message-passing hops
+
+  # --- Classifier ---
+  cls_hidden_dim: 256
+  cls_epochs: 200
+  cls_lr: 0.01
+  cls_weight_decay: 5.0e-4
+
+  # --- MAE ---
+  mae_epochs: 200
+  mae_lr: 1.0e-3
+  mae_weight_decay: 1.0e-4
+  mask_ratio: 0.4
+  mae_gamma: 2
+  pearson_weight: 0.5
+  norm_ratio_weight: 0.3
+
+  # --- Training ---
+  batch_size: 256
+  valid_epoch: 10
+  patience: 9999
+  infer_batch_size: 4096
+
+  # --- Expert Merging ---
+  merge_pseudo_samples: 5000    # number of pseudo data points per expert
+  merge_pseudo_steps: 300      # optimization steps for pseudo data generation
+  merge_pseudo_lr: 0.1         # Adam lr for pseudo data optimization
+  merge_entropy_weight: 0.1    # weight for classifier entropy loss
+  merge_diversity_weight: 0.01  # weight for pairwise diversity loss
+  merge_temperature: 2.0       # temperature T for soft label distillation
+  merge_distill_mae_epochs: 200
+  merge_distill_cls_epochs: 200
+
+  # --- Debug ---
+  debug: true
