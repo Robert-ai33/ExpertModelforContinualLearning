@@ -120,6 +120,7 @@ class LiteExpertCL:
         self.merge_temperature = config.get('merge_temperature', 2.0)
         self.merge_distill_mae_epochs = config.get('merge_distill_mae_epochs', 200)
         self.merge_distill_cls_epochs = config.get('merge_distill_cls_epochs', 200)
+        self.merge_stats_weight = config.get('merge_stats_weight', 1.0)
 
         self.model = LiteModel().to(device)
 
@@ -127,6 +128,7 @@ class LiteExpertCL:
         self.expert_g2l = []   # expert_g2l[eid] = {global_class: local_index}
         self.expert_l2g = []   # expert_l2g[eid] = tensor [local_index -> global_class]
         self.expert_usage_count = []  # usage count from last Joint Test
+        self.expert_stats = []  # {mean, var, n} of training embeddings per expert
 
         self.current_session = 0
 
@@ -267,6 +269,15 @@ class LiteExpertCL:
 
         # Pre-compute local labels for training nodes (only curr_classes nodes)
         train_indices = torch.where(loss_mask)[0]
+
+        # Record embedding statistics for pseudo data generation
+        with torch.no_grad():
+            h_train = h[train_indices]
+            self.expert_stats.append({
+                'mean': h_train.mean(dim=0),
+                'var': h_train.var(dim=0, correction=0),
+                'n': h_train.size(0),
+            })
         local_train_labels = torch.tensor(
             [g2l[labels[idx].item()] for idx in train_indices.tolist()],
             dtype=torch.long, device=self.device)
@@ -429,9 +440,11 @@ class LiteExpertCL:
               f"E{idx_b} (classes {classes_b}, "
               f"usage={self.expert_usage_count[idx_b]})")
 
-        # Step 1: Generate pseudo data for each expert
-        pseudo_a = self._generate_pseudo_data(expert_a, tag="A")
-        pseudo_b = self._generate_pseudo_data(expert_b, tag="B")
+        # Step 1: Generate pseudo data for each expert (per-class count)
+        stats_a = self.expert_stats[idx_a]
+        stats_b = self.expert_stats[idx_b]
+        pseudo_a = self._generate_pseudo_data(expert_a, len(classes_a), stats_a, tag="A")
+        pseudo_b = self._generate_pseudo_data(expert_b, len(classes_b), stats_b, tag="B")
 
         # Step 2: Build soft labels with temperature scaling
         T = self.merge_temperature
@@ -452,6 +465,10 @@ class LiteExpertCL:
         all_pseudo = torch.cat([pseudo_a, pseudo_b], dim=0)
         all_soft_labels = torch.cat([soft_labels_a, soft_labels_b], dim=0)
 
+        perm = torch.randperm(all_pseudo.size(0), device=self.device)
+        all_pseudo = all_pseudo[perm]
+        all_soft_labels = all_soft_labels[perm]
+
         # Step 3: Create merged expert and distill
         merged_expert = LiteExpert(
             self.input_dim, self.cls_hidden_dim, num_merged
@@ -460,29 +477,42 @@ class LiteExpertCL:
         self._distill_mae(merged_expert, all_pseudo)
         self._distill_classifier(merged_expert, all_pseudo, all_soft_labels)
 
-        # Step 4: Remove old experts (reverse order to preserve indices)
+        # Step 4: Compute merged stats for the new expert
+        n_a, n_b = stats_a['n'], stats_b['n']
+        n_ab = n_a + n_b
+        mean_ab = (n_a * stats_a['mean'] + n_b * stats_b['mean']) / n_ab
+        var_ab = ((n_a * (stats_a['var'] + stats_a['mean'] ** 2)
+                   + n_b * (stats_b['var'] + stats_b['mean'] ** 2)) / n_ab
+                  - mean_ab ** 2)
+
+        # Step 5: Remove old experts (reverse order to preserve indices)
         for idx in sorted([idx_a, idx_b], reverse=True):
             del self.model.experts[idx]
             del self.expert_g2l[idx]
             del self.expert_l2g[idx]
             del self.expert_usage_count[idx]
+            del self.expert_stats[idx]
 
-        # Step 5: Add merged expert
+        # Step 6: Add merged expert
         self.model.experts.append(merged_expert)
         self.expert_g2l.append(merged_g2l)
         self.expert_l2g.append(merged_l2g)
         self.expert_usage_count.append(0)
+        self.expert_stats.append({'mean': mean_ab, 'var': var_ab, 'n': n_ab})
 
         print(f"  -> Merged expert manages classes {merged_classes} "
               f"(total experts: {len(self.model.experts)})")
 
-    def _generate_pseudo_data(self, expert, tag=""):
-        """Optimize random data to minimize MAE recon error + classifier entropy + diversity."""
+    def _generate_pseudo_data(self, expert, num_classes, stats, tag=""):
+        """Optimize random data to minimize MAE recon + entropy + balance + stats match."""
         expert.eval()
         for p in expert.parameters():
             p.requires_grad = False
 
-        n = self.merge_pseudo_samples
+        target_mean = stats['mean'].detach()
+        target_var = stats['var'].detach()
+
+        n = num_classes * self.merge_pseudo_samples
         h_fake = torch.randn(n, self.input_dim, device=self.device,
                              requires_grad=True)
         optimizer = optim.Adam([h_fake], lr=self.merge_pseudo_lr)
@@ -513,16 +543,24 @@ class LiteExpertCL:
             avg_probs = probs.mean(dim=0)
             loss_diversity = (avg_probs * torch.log(avg_probs + 1e-8)).sum()
 
+            # Stats match: align fake data distribution with real training data
+            fake_mean = h_fake.mean(dim=0)
+            fake_var = h_fake.var(dim=0, correction=0)
+            loss_stats = (F.mse_loss(fake_mean, target_mean)
+                          + F.mse_loss(fake_var, target_var))
+
             loss = (loss_mae
                     + self.merge_entropy_weight * loss_entropy
-                    + self.merge_diversity_weight * loss_diversity)
+                    + self.merge_diversity_weight * loss_diversity
+                    + self.merge_stats_weight * loss_stats)
             loss.backward()
             optimizer.step()
 
             if step % 50 == 0:
                 pbar.set_postfix(mae=f'{loss_mae.item():.4f}',
                                  ent=f'{loss_entropy.item():.4f}',
-                                 bal=f'{loss_diversity.item():.4f}')
+                                 bal=f'{loss_diversity.item():.4f}',
+                                 stat=f'{loss_stats.item():.4f}')
 
         return h_fake.detach()
 
