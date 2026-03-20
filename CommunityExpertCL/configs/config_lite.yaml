@@ -25,7 +25,7 @@ default:
   mae_epochs: 200
   mae_lr: 1.0e-3
   mae_weight_decay: 1.0e-4
-  mask_ratio: 0.4
+  mask_ratio: 0.5
   mae_gamma: 2
   pearson_weight: 0.5
   norm_ratio_weight: 0.3
@@ -37,11 +37,11 @@ default:
   infer_batch_size: 4096
 
   # --- Expert Merging ---
-  merge_pseudo_samples: 10000    # number of pseudo data points per expert
+  merge_pseudo_samples: 20000    # number of pseudo data points per expert
   merge_pseudo_steps: 300      # optimization steps for pseudo data generation
   merge_pseudo_lr: 0.1         # Adam lr for pseudo data optimization
-  merge_entropy_weight: 0.1    # weight for classifier entropy loss
-  merge_diversity_weight: 0.1  # weight for pairwise diversity loss
+  merge_entropy_weight: 1    # weight for classifier entropy loss
+  merge_diversity_weight: 0.2  # weight for pairwise diversity loss
   merge_temperature: 2.0       # temperature T for soft label distillation
   merge_distill_mae_epochs: 200
   merge_distill_cls_epochs: 200

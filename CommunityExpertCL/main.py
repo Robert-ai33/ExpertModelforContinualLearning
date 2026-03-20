@@ -89,6 +89,8 @@ def main():
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed precision training (AMP)')
+    parser.add_argument('--svd_dim', type=int, default=0,
+                        help='Truncated SVD target dim (0 = disabled)')
     args = parser.parse_args()
 
     # Load config
@@ -115,6 +117,8 @@ def main():
           f"v/S={config['split_v']}/{config['split_S']}")
     print(f"Model: {args.model}")
     print(f"AMP: {'enabled' if args.amp else 'disabled'}")
+    if args.svd_dim > 0:
+        print(f"SVD dim: {args.svd_dim}")
 
     # Seeds
     seeds = config.get('seed', [0, 1, 2, 3, 4])
@@ -131,7 +135,8 @@ def main():
 
         seed_everything(seed)
 
-        graph_dataset = GraphDataset(args.dataset, args.data_path)
+        graph_dataset = GraphDataset(args.dataset, args.data_path,
+                                     svd_dim=args.svd_dim)
 
         task_loader = TaskLoader(
             batch_size=config.get('batch_size', 256),

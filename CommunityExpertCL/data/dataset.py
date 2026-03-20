@@ -7,6 +7,7 @@ Supports: cora, citeseer, cora-full, coauthor-cs, amazon-computers, wikics,
 import heapq
 import torch
 import numpy as np
+from sklearn.decomposition import TruncatedSVD
 
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, to_undirected
@@ -28,9 +29,10 @@ SUPPORTED_DATASETS = {
 class GraphDataset(Dataset):
     """Undirected graph dataset for expert-based continual learning."""
 
-    def __init__(self, dataset, data_path):
+    def __init__(self, dataset, data_path, svd_dim=0):
         self.dataset = dataset
         self.data_path = data_path
+        self.svd_dim = svd_dim
         if dataset not in SUPPORTED_DATASETS:
             raise ValueError(
                 f"Unknown dataset '{dataset}'. Supported: {SUPPORTED_DATASETS}"
@@ -110,6 +112,13 @@ class GraphDataset(Dataset):
         edge_index, x, y = self._remove_isolated_nodes(edge_index, data.x, data.y)
 
         self.original_edge_index = edge_index.clone()
+
+        if self.svd_dim > 0 and x.size(1) > self.svd_dim:
+            print(f"Applying Truncated SVD: {x.size(1)} -> {self.svd_dim} dims...")
+            svd = TruncatedSVD(n_components=self.svd_dim, random_state=0)
+            x = torch.tensor(svd.fit_transform(x.numpy()), dtype=x.dtype)
+            explained = svd.explained_variance_ratio_.sum() * 100
+            print(f"  Explained variance: {explained:.1f}%")
 
         edge_index_sl, _ = add_self_loops(edge_index)
         new_data = Data(x=x, edge_index=edge_index_sl, y=y)
