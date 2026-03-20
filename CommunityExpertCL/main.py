@@ -50,7 +50,7 @@ EXP_SETTINGS = {
         'split_v': 1,
     },
     'amazon-computers': {
-        'class_splits': [[0, 1], [6, 7], [2, 3], [4, 5], [8, 9]],
+        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
         'split_S': 5,
         'split_t': 1,
         'split_v': 1,

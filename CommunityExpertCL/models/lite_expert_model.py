@@ -486,7 +486,6 @@ class LiteExpertCL:
         h_fake = torch.randn(n, self.input_dim, device=self.device,
                              requires_grad=True)
         optimizer = optim.Adam([h_fake], lr=self.merge_pseudo_lr)
-        diag_mask = ~torch.eye(n, dtype=torch.bool, device=self.device)
 
         pbar = tqdm(range(self.merge_pseudo_steps), desc=f"  GenData-{tag}")
         for step in pbar:
@@ -504,16 +503,15 @@ class LiteExpertCL:
             if self.norm_ratio_weight > 0:
                 loss_mae = loss_mae + self.norm_ratio_weight * norm_ratio_loss(h_fake, recon)
 
-            # Classifier confidence: minimize entropy
+            # Per-sample confidence: minimize entropy so each sample has a clear class
             logits = expert.classifier(h_fake)
             probs = F.softmax(logits, dim=1)
             log_probs = F.log_softmax(logits, dim=1)
             loss_entropy = -(probs * log_probs).sum(dim=1).mean()
 
-            # Diversity: penalize high pairwise cosine similarity
-            h_norm = F.normalize(h_fake, dim=1)
-            sim_matrix = h_norm @ h_norm.t()
-            loss_diversity = sim_matrix[diag_mask].mean()
+            # Class balance: maximize entropy of avg prediction → uniform class coverage
+            avg_probs = probs.mean(dim=0)
+            loss_diversity = (avg_probs * torch.log(avg_probs + 1e-8)).sum()
 
             loss = (loss_mae
                     + self.merge_entropy_weight * loss_entropy
@@ -524,7 +522,7 @@ class LiteExpertCL:
             if step % 50 == 0:
                 pbar.set_postfix(mae=f'{loss_mae.item():.4f}',
                                  ent=f'{loss_entropy.item():.4f}',
-                                 div=f'{loss_diversity.item():.4f}')
+                                 bal=f'{loss_diversity.item():.4f}')
 
         return h_fake.detach()
 

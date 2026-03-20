@@ -10,7 +10,7 @@ default:
   split_v: 1
 
   # --- Expert Parameters ---
-  max_experts: 4            # merge when reaching this capacity
+  max_experts: 5            # merge when reaching this capacity
 
   # --- Parameter-free GCN ---
   gcn_layers: 1           # number of message-passing hops
@@ -37,11 +37,11 @@ default:
   infer_batch_size: 4096
 
   # --- Expert Merging ---
-  merge_pseudo_samples: 5000    # number of pseudo data points per expert
+  merge_pseudo_samples: 10000    # number of pseudo data points per expert
   merge_pseudo_steps: 300      # optimization steps for pseudo data generation
   merge_pseudo_lr: 0.1         # Adam lr for pseudo data optimization
   merge_entropy_weight: 0.1    # weight for classifier entropy loss
-  merge_diversity_weight: 0.01  # weight for pairwise diversity loss
+  merge_diversity_weight: 0.1  # weight for pairwise diversity loss
   merge_temperature: 2.0       # temperature T for soft label distillation
   merge_distill_mae_epochs: 200
   merge_distill_cls_epochs: 200
