@@ -10,7 +10,7 @@ default:
   split_v: 1
 
   # --- Expert Parameters ---
-  max_experts: 2            # merge when reaching this capacity
+  max_experts: 4            # merge when reaching this capacity
 
   # --- Parameter-free GCN ---
   gcn_layers: 1           # number of message-passing hops
