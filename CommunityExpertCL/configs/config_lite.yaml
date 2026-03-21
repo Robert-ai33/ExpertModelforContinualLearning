@@ -43,7 +43,7 @@ default:
   merge_entropy_weight: 0.1    # weight for classifier entropy loss
   merge_diversity_weight: 0.1  # weight for pairwise diversity loss
   merge_temperature: 1.5       # temperature T for soft label distillation
-  merge_stats_weight: 0.5       # weight for mean/var matching loss
+  merge_stats_weight: 1       # weight for mean/var matching loss
   merge_distill_mae_epochs: 200
   merge_distill_cls_epochs: 200
 
