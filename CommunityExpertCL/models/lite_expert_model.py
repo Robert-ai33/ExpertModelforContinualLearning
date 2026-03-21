@@ -469,10 +469,13 @@ class LiteExpertCL:
         all_pseudo = all_pseudo[perm]
         all_soft_labels = all_soft_labels[perm]
 
-        # Step 3: Create merged expert and distill
+        # Step 3: Create merged expert with averaged initial weights
         merged_expert = LiteExpert(
             self.input_dim, self.cls_hidden_dim, num_merged
         ).to(self.device)
+
+        self._init_merged_weights(merged_expert, expert_a, expert_b,
+                                  a_to_merged, b_to_merged, num_merged)
 
         self._distill_mae(merged_expert, all_pseudo)
         self._distill_classifier(merged_expert, all_pseudo, all_soft_labels)
@@ -502,6 +505,20 @@ class LiteExpertCL:
 
         print(f"  -> Merged expert manages classes {merged_classes} "
               f"(total experts: {len(self.model.experts)})")
+
+    @torch.no_grad()
+    def _init_merged_weights(self, merged, expert_a, expert_b,
+                             a_to_merged, b_to_merged, num_merged):
+        """Initialize merged expert MAE weights by averaging two old experts."""
+        # MAE decoder: same shape, direct average
+        for p_m, p_a, p_b in zip(merged.mae_decoder.parameters(),
+                                  expert_a.mae_decoder.parameters(),
+                                  expert_b.mae_decoder.parameters()):
+            p_m.data.copy_((p_a.data + p_b.data) / 2)
+
+        # mask_token: direct average
+        merged.mask_token.data.copy_(
+            (expert_a.mask_token.data + expert_b.mask_token.data) / 2)
 
     def _generate_pseudo_data(self, expert, num_classes, stats, tag=""):
         """Optimize random data to minimize MAE recon + entropy + balance + stats match."""
