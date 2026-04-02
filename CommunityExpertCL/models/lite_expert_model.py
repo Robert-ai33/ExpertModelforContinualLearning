@@ -15,13 +15,61 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 
 from torch_geometric.utils import degree
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
-from .prediction_model import (
-    scaled_cosine_error, scaled_cosine_error_per_node,
-    pearson_correlation_loss, pearson_loss_per_node,
-    norm_ratio_loss, norm_ratio_loss_per_node,
-)
+
+# ======================================================================
+# Loss Functions
+# ======================================================================
+
+def scaled_cosine_error(pred, target, gamma=2):
+    """(1 - cosine_similarity)^gamma, averaged over samples."""
+    cos_sim = F.cosine_similarity(pred, target, dim=1)
+    return ((1 - cos_sim) ** gamma).mean()
+
+
+def scaled_cosine_error_per_node(pred, target, gamma=2):
+    """Per-node (1 - cosine_similarity)^gamma. Returns (N,) loss."""
+    cos_sim = F.cosine_similarity(pred, target, dim=1)
+    return (1 - cos_sim) ** gamma
+
+
+def pearson_correlation_loss(x, recon, eps=1e-8):
+    """1 - Pearson correlation between x and recon (flattened)."""
+    x_flat = x.reshape(-1)
+    recon_flat = recon.reshape(-1)
+    x_c = x_flat - x_flat.mean()
+    recon_c = recon_flat - recon_flat.mean()
+    pearson = (x_c * recon_c).sum() / (x_c.norm() * recon_c.norm() + eps)
+    return 1 - pearson
+
+
+def pearson_loss_per_node(x, recon, eps=1e-8):
+    """Per-node 1 - Pearson correlation. x, recon: (N, D). Returns (N,) loss."""
+    x_c = x - x.mean(dim=1, keepdim=True)
+    recon_c = recon - recon.mean(dim=1, keepdim=True)
+    dot = (x_c * recon_c).sum(dim=1)
+    norm_x = x_c.norm(dim=1) + eps
+    norm_recon = recon_c.norm(dim=1) + eps
+    pearson = dot / (norm_x * norm_recon)
+    return 1 - pearson
+
+
+def norm_ratio_loss(x, recon, eps=1e-8):
+    """(log(||recon||+eps) - log(||x||+eps))^2 per sample, then mean."""
+    norm_x = x.norm(dim=1) + eps
+    norm_recon = recon.norm(dim=1) + eps
+    log_diff = torch.log(norm_recon) - torch.log(norm_x)
+    return (log_diff ** 2).mean()
+
+
+def norm_ratio_loss_per_node(x, recon, eps=1e-8):
+    """Per-node (log(||recon||+eps) - log(||x||+eps))^2. Returns (N,) loss."""
+    norm_x = x.norm(dim=1) + eps
+    norm_recon = recon.norm(dim=1) + eps
+    log_diff = torch.log(norm_recon) - torch.log(norm_x)
+    return log_diff ** 2
 
 
 # ======================================================================
@@ -131,6 +179,27 @@ class LiteExpertCL:
         self.expert_stats = []  # {mean, var, n} of training embeddings per expert
 
         self.current_session = 0
+
+    # ==================== Expert Creation ====================
+
+    def _create_expert_with_fixed_init(self, num_local_classes):
+        """Create expert with fixed-seed initialization so every expert starts identically."""
+        cpu_rng = torch.random.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state(self.device) if self.device.type == 'cuda' else None
+
+        torch.manual_seed(42)
+        if cuda_rng is not None:
+            torch.cuda.manual_seed(42)
+
+        expert = LiteExpert(
+            self.input_dim, self.cls_hidden_dim, num_local_classes
+        ).to(self.device)
+
+        torch.random.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, self.device)
+
+        return expert
 
     # ==================== Embedding ====================
 
@@ -243,10 +312,7 @@ class LiteExpertCL:
         g2l = {c: i for i, c in enumerate(sorted_classes)}
         l2g = torch.tensor(sorted_classes, dtype=torch.long, device=self.device)
 
-        # Always create and append new expert
-        new_expert = LiteExpert(
-            self.input_dim, self.cls_hidden_dim, len(sorted_classes)
-        ).to(self.device)
+        new_expert = self._create_expert_with_fixed_init(len(sorted_classes))
 
         self.model.experts.append(new_expert)
         self.expert_g2l.append(g2l)
@@ -509,14 +575,36 @@ class LiteExpertCL:
     @torch.no_grad()
     def _init_merged_weights(self, merged, expert_a, expert_b,
                              a_to_merged, b_to_merged, num_merged):
-        """Initialize merged expert MAE weights by averaging two old experts."""
-        # MAE decoder: same shape, direct average
-        for p_m, p_a, p_b in zip(merged.mae_decoder.parameters(),
-                                  expert_a.mae_decoder.parameters(),
-                                  expert_b.mae_decoder.parameters()):
-            p_m.data.copy_((p_a.data + p_b.data) / 2)
+        """Initialize merged expert via weight-space permutation alignment + averaging.
 
-        # mask_token: direct average
+        Uses the Hungarian algorithm (LAP) to find the optimal neuron permutation
+        that minimizes ||W_A - W_B P||_F before averaging weights. This eliminates
+        the permutation symmetry issue and turns naive averaging into a constructive
+        interpolation in the same loss basin.
+        """
+        # ── MAE Decoder alignment ──
+        # Layer 1: [hidden, input] — each row is one hidden neuron's receptive field
+        wa1 = expert_a.mae_decoder[0].weight.data
+        wb1 = expert_b.mae_decoder[0].weight.data
+
+        cost_mae = torch.cdist(wa1, wb1, p=2)
+        _, col_mae = linear_sum_assignment(cost_mae.cpu().numpy())
+        pm = torch.tensor(col_mae, device=self.device, dtype=torch.long)
+
+        merged.mae_decoder[0].weight.data.copy_((wa1 + wb1[pm]) / 2)
+        merged.mae_decoder[0].bias.data.copy_(
+            (expert_a.mae_decoder[0].bias.data
+             + expert_b.mae_decoder[0].bias.data[pm]) / 2)
+
+        # Layer 2: [output, hidden] — columns correspond to hidden neurons
+        merged.mae_decoder[2].weight.data.copy_(
+            (expert_a.mae_decoder[2].weight.data
+             + expert_b.mae_decoder[2].weight.data[:, pm]) / 2)
+        merged.mae_decoder[2].bias.data.copy_(
+            (expert_a.mae_decoder[2].bias.data
+             + expert_b.mae_decoder[2].bias.data) / 2)
+
+        # mask_token: input-space vector, no permutation needed
         merged.mask_token.data.copy_(
             (expert_a.mask_token.data + expert_b.mask_token.data) / 2)
 

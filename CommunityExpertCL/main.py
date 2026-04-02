@@ -4,7 +4,6 @@ CommunityExpertCL - Main entry point.
 Usage:
   python main.py --dataset cora --gpu 0
   python main.py --dataset coauthor-cs --gpu 0 --amp
-  python main.py --dataset cora --model lite --config_path ./configs/config_lite.yaml
 """
 
 import os
@@ -15,7 +14,7 @@ import numpy as np
 import torch
 
 from data import GraphDataset, TaskLoader
-from models import CommunityExpertCL, LiteExpertCL
+from models import LiteExpertCL
 from utils import seed_everything
 
 
@@ -40,7 +39,7 @@ EXP_SETTINGS = {
             [42,43,44,45,46,47,48], [49,50,51,52,53,54,55],[56,57,58,59,60,61,62],[63,64,65,66,67,68,69]
         ],
         'split_S': 5,
-        'split_t': 2,
+        'split_t': 1,
         'split_v': 1,
     },
     'coauthor-cs': {
@@ -81,10 +80,6 @@ def main():
     parser.add_argument('--dataset', type=str, default='cora',
                         choices=list(EXP_SETTINGS.keys()))
     parser.add_argument('--data_path', type=str, default='./data_files/')
-    parser.add_argument('--config_path', type=str, default='./configs/config.yaml')
-    parser.add_argument('--model', type=str, default='expert',
-                        choices=['expert', 'lite'],
-                        help='Model type: expert (CommunityExpertCL) or lite (LiteExpertCL)')
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--amp', action='store_true',
@@ -94,7 +89,8 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    with open(args.config_path, 'r', encoding='utf-8') as f:
+    config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_lite.yaml')
+    with open(config_path, 'r', encoding='utf-8') as f:
         full_config = yaml.safe_load(f)
     config = full_config['default']
 
@@ -115,7 +111,6 @@ def main():
     print(f"Class splits: {config['class_splits']}")
     print(f"Split ratio: t/S={config['split_t']}/{config['split_S']}, "
           f"v/S={config['split_v']}/{config['split_S']}")
-    print(f"Model: {args.model}")
     print(f"AMP: {'enabled' if args.amp else 'disabled'}")
     if args.svd_dim > 0:
         print(f"SVD dim: {args.svd_dim}")
@@ -147,8 +142,7 @@ def main():
             split_v=config['split_v'],
         )
 
-        ModelClass = LiteExpertCL if args.model == 'lite' else CommunityExpertCL
-        model = ModelClass(
+        model = LiteExpertCL(
             task_loader=task_loader,
             config=config,
             device=device,
