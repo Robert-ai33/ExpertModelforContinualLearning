@@ -541,7 +541,8 @@ class LiteExpertCL:
         ).to(self.device)
 
         self._init_merged_weights(merged_expert, expert_a, expert_b,
-                                  a_to_merged, b_to_merged, num_merged)
+                                  a_to_merged, b_to_merged, num_merged,
+                                  stats_a, stats_b)
 
         self._distill_mae(merged_expert, all_pseudo)
         self._distill_classifier(merged_expert, all_pseudo, all_soft_labels)
@@ -574,39 +575,49 @@ class LiteExpertCL:
 
     @torch.no_grad()
     def _init_merged_weights(self, merged, expert_a, expert_b,
-                             a_to_merged, b_to_merged, num_merged):
-        """Initialize merged expert via weight-space permutation alignment + averaging.
+                             a_to_merged, b_to_merged, num_merged,
+                             stats_a, stats_b):
+        """Initialize merged expert via weight-space permutation alignment + weighted averaging.
 
         Uses the Hungarian algorithm (LAP) to find the optimal neuron permutation
-        that minimizes ||W_A - W_B P||_F before averaging weights. This eliminates
-        the permutation symmetry issue and turns naive averaging into a constructive
-        interpolation in the same loss basin.
+        that minimizes ||W_A - W_B P||_F before averaging weights. Parameters are
+        then merged via weighted average proportional to each expert's training
+        data count (stored in stats['n']).
         """
-        # ── MAE Decoder alignment ──
-        # Layer 1: [hidden, input] — each row is one hidden neuron's receptive field
-        wa1 = expert_a.mae_decoder[0].weight.data
-        wb1 = expert_b.mae_decoder[0].weight.data
+        n_a = stats_a['n']
+        n_b = stats_b['n']
+        alpha = n_a / (n_a + n_b)  # weight for expert_a
 
-        cost_mae = torch.cdist(wa1, wb1, p=2)
+        # ── MAE Decoder alignment ──
+        wa1 = expert_a.mae_decoder[0].weight.data   # [hidden, input]
+        wb1 = expert_b.mae_decoder[0].weight.data
+        ba1 = expert_a.mae_decoder[0].bias.data      # [hidden]
+        bb1 = expert_b.mae_decoder[0].bias.data
+        wa2 = expert_a.mae_decoder[2].weight.data    # [output, hidden]
+        wb2 = expert_b.mae_decoder[2].weight.data
+
+        # Composite cost = Σ ||Δparam_i||_2^2 over all parameters tied to each hidden neuron
+        cost_mae = torch.cdist(wa1, wb1, p=2) ** 2
+        cost_mae += torch.cdist(ba1.unsqueeze(1), bb1.unsqueeze(1), p=2) ** 2
+        cost_mae += torch.cdist(wa2.t(), wb2.t(), p=2) ** 2
+
         _, col_mae = linear_sum_assignment(cost_mae.cpu().numpy())
         pm = torch.tensor(col_mae, device=self.device, dtype=torch.long)
 
-        merged.mae_decoder[0].weight.data.copy_((wa1 + wb1[pm]) / 2)
-        merged.mae_decoder[0].bias.data.copy_(
-            (expert_a.mae_decoder[0].bias.data
-             + expert_b.mae_decoder[0].bias.data[pm]) / 2)
+        merged.mae_decoder[0].weight.data.copy_(alpha * wa1 + (1 - alpha) * wb1[pm])
+        merged.mae_decoder[0].bias.data.copy_(alpha * ba1 + (1 - alpha) * bb1[pm])
 
         # Layer 2: [output, hidden] — columns correspond to hidden neurons
         merged.mae_decoder[2].weight.data.copy_(
-            (expert_a.mae_decoder[2].weight.data
-             + expert_b.mae_decoder[2].weight.data[:, pm]) / 2)
+            alpha * wa2 + (1 - alpha) * wb2[:, pm])
         merged.mae_decoder[2].bias.data.copy_(
-            (expert_a.mae_decoder[2].bias.data
-             + expert_b.mae_decoder[2].bias.data) / 2)
+            alpha * expert_a.mae_decoder[2].bias.data
+            + (1 - alpha) * expert_b.mae_decoder[2].bias.data)
 
-        # mask_token: input-space vector, no permutation needed
+        # mask_token: weighted average proportional to training data count
         merged.mask_token.data.copy_(
-            (expert_a.mask_token.data + expert_b.mask_token.data) / 2)
+            alpha * expert_a.mask_token.data
+            + (1 - alpha) * expert_b.mask_token.data)
 
     def _generate_pseudo_data(self, expert, num_classes, stats, tag=""):
         """Optimize random data to minimize MAE recon + entropy + balance + stats match."""
