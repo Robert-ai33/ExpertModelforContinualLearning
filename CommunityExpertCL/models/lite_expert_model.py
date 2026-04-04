@@ -604,15 +604,14 @@ class LiteExpertCL:
         _, col_mae = linear_sum_assignment(cost_mae.cpu().numpy())
         pm = torch.tensor(col_mae, device=self.device, dtype=torch.long)
 
-        merged.mae_decoder[0].weight.data.copy_(alpha * wa1 + (1 - alpha) * wb1[pm])
-        merged.mae_decoder[0].bias.data.copy_(alpha * ba1 + (1 - alpha) * bb1[pm])
+        merged.mae_decoder[0].weight.data.copy_((wa1 + wb1[pm]) / 2)
+        merged.mae_decoder[0].bias.data.copy_((ba1 + bb1[pm]) / 2)
 
         # Layer 2: [output, hidden] — columns correspond to hidden neurons
-        merged.mae_decoder[2].weight.data.copy_(
-            alpha * wa2 + (1 - alpha) * wb2[:, pm])
+        merged.mae_decoder[2].weight.data.copy_((wa2 + wb2[:, pm]) / 2)
         merged.mae_decoder[2].bias.data.copy_(
-            alpha * expert_a.mae_decoder[2].bias.data
-            + (1 - alpha) * expert_b.mae_decoder[2].bias.data)
+            (expert_a.mae_decoder[2].bias.data
+             + expert_b.mae_decoder[2].bias.data) / 2)
 
         # mask_token: weighted average proportional to training data count
         merged.mask_token.data.copy_(
