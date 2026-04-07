@@ -111,9 +111,10 @@ class TaskLoader:
 
             cumulative_classes.extend(classes)
 
-            # Training subgraph: external neighbors from seen classes only
+            # Training subgraph: all seen-class nodes (aligned with CGLB inter_edge)
             curr_subgraph = self._create_task_subgraph(
-                classes, allowed_external_classes=list(cumulative_classes)
+                list(cumulative_classes),
+                allowed_external_classes=list(cumulative_classes)
             )
             self.subgraph_per_task.append(curr_subgraph)
 

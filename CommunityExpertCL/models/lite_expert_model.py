@@ -219,6 +219,7 @@ class LiteExpertCL:
 
         acc_matrix = []
         joint_acc_history = []
+        joint_macro_history = []
 
         for session_id in range(num_sessions):
             self.current_session = session_id
@@ -274,7 +275,9 @@ class LiteExpertCL:
             joint_res = self._evaluate_subgraph(joint_subgraph, test_idx_joint)
 
             joint_acc_history.append(joint_res['acc'])
+            joint_macro_history.append(joint_res['macro_acc'])
             print(f"  Acc={joint_res['acc']:.4f} "
+                  f"Macro={joint_res['macro_acc']:.4f} "
                   f"({joint_res['correct']}/{joint_res['total']})")
 
             # Record usage counts for merging decisions
@@ -296,12 +299,15 @@ class LiteExpertCL:
 
         self._print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
 
-        print(f"\nJoint Accuracy: " + ", ".join(
+        print(f"\nJoint Accuracy (micro): " + ", ".join(
             [f"S{i}={joint_acc_history[i]:.4f}" for i in range(num_sessions)]))
+        print(f"Joint Accuracy (macro): " + ", ".join(
+            [f"S{i}={joint_macro_history[i]:.4f}" for i in range(num_sessions)]))
 
         return {
             'acc_matrix': acc_matrix,
             'joint_acc': joint_acc_history,
+            'joint_macro_acc': joint_macro_history,
         }
 
     def _train_session(self, session_id, subgraph, train_idx, valid_idx,
@@ -895,16 +901,30 @@ class LiteExpertCL:
 
         correct = 0
         total = 0
+        per_class_correct = {}
+        per_class_total = {}
         for gid in test_idx:
             if gid in g2l:
                 lid = g2l[gid]
-                if node_preds[lid].item() == true_labels[lid].item():
+                pred = node_preds[lid].item()
+                true = true_labels[lid].item()
+                per_class_total[true] = per_class_total.get(true, 0) + 1
+                if pred == true:
                     correct += 1
+                    per_class_correct[true] = per_class_correct.get(true, 0) + 1
                 total += 1
 
         acc = correct / total if total > 0 else 0.0
+        per_class_acc = []
+        for c in sorted(per_class_total.keys()):
+            c_correct = per_class_correct.get(c, 0)
+            c_total = per_class_total[c]
+            per_class_acc.append(c_correct / c_total if c_total > 0 else 0.0)
+        macro_acc = sum(per_class_acc) / len(per_class_acc) if per_class_acc else 0.0
+
         return {
-            'acc': acc, 'correct': correct, 'total': total,
+            'acc': acc, 'macro_acc': macro_acc,
+            'correct': correct, 'total': total,
             'expert_assignments': expert_assigns,
         }
 
