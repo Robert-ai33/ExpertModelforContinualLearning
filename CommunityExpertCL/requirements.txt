@@ -3,3 +3,6 @@ torch_geometric>=2.4
 numpy
 pyyaml
 ogb
+scipy
+matplotlib
+POT>=0.8.0

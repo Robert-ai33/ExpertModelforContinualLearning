@@ -1,0 +1,71 @@
+# Baseline Methods Configuration
+# Shared by all baseline CL methods (bare, joint, ewc, mas, lwf, gem, twp, ergnn, cat, cosine, teen, delome)
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- GCN Backbone ---
+  gcn_hidden_dim: 256
+  gcn_layers: 2
+  gcn_dropout: 0.0
+
+  # --- Training ---
+  baseline_epochs: 200
+  baseline_lr: 0.005
+  baseline_weight_decay: 5.0e-4
+  batch_size: 256
+
+  # --- EWC ---
+  ewc_lambda: 10000.0
+
+  # --- MAS ---
+  mas_lambda: 1.0
+
+  # --- LwF ---
+  lwf_lambda: 1.0
+  lwf_temperature: 2.0
+
+  # --- GEM ---
+  gem_margin: 0.5
+  gem_n_memories: 20
+
+  # --- TWP ---
+  twp_lambda_l: 10000.0
+  twp_beta: 0.01
+
+  # --- ER-GNN ---
+  ergnn_budget: 50
+  ergnn_d: 0.5
+  ergnn_replay_weight: 1.0
+
+  # --- CaT (CGM) ---
+  cat_budget: 200
+  cat_n_encoders: 10
+  cat_feat_lr: 0.01
+  cat_hid_dim: 256
+  cat_emb_dim: 128
+  cat_n_layers: 2
+  cat_hop: 1
+
+  # --- COSINE ---
+  cosine_T: 16.0
+
+  # --- TEEN ---
+  teen_T: 16.0
+  teen_softmax_t: 20.0
+  teen_shift_weight: 0.1
+
+  # --- DeLoMe ---
+  delome_budget: 50
+  delome_tro: 1.0
+  delome_condense_epochs: 200
+  delome_feat_lr: 0.0001
+  delome_sgc_k: 2
+  delome_hidden_dim: 256
+  delome_cls_balance: logita
+

@@ -4,6 +4,7 @@ CommunityExpertCL - Main entry point.
 Usage:
   python main.py --dataset cora --gpu 0
   python main.py --dataset coauthor-cs --gpu 0 --amp
+  python main.py --dataset cora --method ewc --gpu 0
 """
 
 import os
@@ -14,7 +15,7 @@ import numpy as np
 import torch
 
 from data import GraphDataset, TaskLoader
-from models import LiteExpertCL
+from models import LiteExpertCL, BaselineCL
 from utils import seed_everything
 
 
@@ -59,14 +60,14 @@ EXP_SETTINGS = {
     'wikics': {
         'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
         'split_S': 5,
-        'split_t': 3,
+        'split_t': 1,
         'split_v': 1,
     },
     'ogbn-arxiv': {
         'class_splits': [[0,1,2,3],[4,5,6,7],[8,9,10,11],[12,13,14,15],[16,17,18,19],[20,21,22,23],[24,25,26,27],[28,29,30,31],[32,33,34,35],[36,37,38,39]],
-        'split_S': 10,
-        'split_t': 3,
-        'split_v': 2,
+        'split_S': 5,
+        'split_t': 1,
+        'split_v': 1,
     },
     'ogbn-products': {
         'class_splits': [[6,7,8,9],[10,11,12,13],[14,15,16,17],[18,19,20,21],[22,23,24,25]],
@@ -84,6 +85,9 @@ def main():
     parser.add_argument('--data_path', type=str, default='./data_files/')
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--method', type=str, default='lite',
+                        choices=['lite'] + BaselineCL.METHODS,
+                        help='CL method to run (default: lite)')
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed precision training (AMP)')
     parser.add_argument('--svd_dim', type=int, default=0,
@@ -91,7 +95,10 @@ def main():
     args = parser.parse_args()
 
     # Load config
-    config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_lite.yaml')
+    if args.method == 'lite':
+        config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_lite.yaml')
+    else:
+        config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_baseline.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         full_config = yaml.safe_load(f)
     config = full_config['default']
@@ -109,11 +116,13 @@ def main():
         f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     )
     print(f"Device: {device}")
+    print(f"Method: {args.method}")
     print(f"Dataset: {args.dataset}")
     print(f"Class splits: {config['class_splits']}")
     print(f"Split ratio: t/S={config['split_t']}/{config['split_S']}, "
           f"v/S={config['split_v']}/{config['split_S']}")
-    print(f"AMP: {'enabled' if args.amp else 'disabled'}")
+    if args.method == 'lite':
+        print(f"AMP: {'enabled' if args.amp else 'disabled'}")
     if args.svd_dim > 0:
         print(f"SVD dim: {args.svd_dim}")
 
@@ -144,11 +153,19 @@ def main():
             split_v=config['split_v'],
         )
 
-        model = LiteExpertCL(
-            task_loader=task_loader,
-            config=config,
-            device=device,
-        )
+        if args.method == 'lite':
+            model = LiteExpertCL(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+            )
+        else:
+            model = BaselineCL(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+                method=args.method,
+            )
 
         results = model.fit(trial)
 
@@ -160,7 +177,7 @@ def main():
 
     # Final summary across trials
     print(f"\n{'='*60}")
-    print(f"FINAL SUMMARY ({ntrials} trials)")
+    print(f"FINAL SUMMARY [{args.method.upper()}] ({ntrials} trials)")
     print(f"{'='*60}")
     print(f"Joint Accuracy: {np.mean(all_acc):.4f} "
           f"\u00b1 {np.std(all_acc):.4f}")

@@ -82,23 +82,22 @@ def paramfree_gcn(x, edge_index, num_layers=1):
     row, col = edge_index[0], edge_index[1]
     deg = degree(col, num_nodes, dtype=x.dtype).clamp(min=1)
     deg_inv_sqrt = deg.pow(-0.5)
+    edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
+    adj = torch.sparse_coo_tensor(
+        torch.stack([col, row]), edge_weight, (num_nodes, num_nodes)
+    ).coalesce()
 
     h = x
     for _ in range(num_layers):
-        src_norm = deg_inv_sqrt[row]
-        dst_norm = deg_inv_sqrt[col]
-        edge_weight = src_norm * dst_norm
-        out = torch.zeros_like(h)
-        out.scatter_add_(0, col.unsqueeze(1).expand_as(h[row]),
-                         h[row] * edge_weight.unsqueeze(1))
-        h = out
+        h = torch.sparse.mm(adj, h)
     return h
 
 
 class LiteExpert(nn.Module):
-    """Single expert: MAE decoder + learnable mask_token + classifier (local classes only)."""
+    """Single expert: MAE decoder + neighbor predictor + classifier."""
 
-    def __init__(self, embed_dim, cls_hidden_dim, num_local_classes):
+    def __init__(self, embed_dim, cls_hidden_dim, num_local_classes, np_hidden_dim):
         super().__init__()
         self.mae_decoder = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
@@ -107,6 +106,12 @@ class LiteExpert(nn.Module):
         )
         self.mask_token = nn.Parameter(torch.zeros(embed_dim))
         nn.init.xavier_uniform_(self.mask_token.unsqueeze(0))
+
+        self.neighbor_predictor = nn.Sequential(
+            nn.Linear(embed_dim * 2, np_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(np_hidden_dim, 1),
+        )
 
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, cls_hidden_dim),
@@ -156,6 +161,16 @@ class LiteExpertCL:
         self.pearson_weight = config.get('pearson_weight', 0.0)
         self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
 
+        self.np_hidden_dim = config.get('np_hidden_dim', 256)
+        self.np_epochs = config.get('np_epochs', 100)
+        self.np_lr = float(config.get('np_lr', 1e-3))
+        self.np_wd = float(config.get('np_weight_decay', 1e-4))
+        self.np_neg_ratio = config.get('np_neg_ratio', 3)
+        self.np_topk_ratio = config.get('np_topk_ratio', 0.05)
+        self.np_enriched_row_chunk = config.get('np_enriched_row_chunk', 512)
+        self.np_enriched_col_chunk = config.get('np_enriched_col_chunk', 512)
+        self.neighbor_stats_weight = config.get('neighbor_stats_weight', 1.0)
+
         self.use_amp = config.get('use_amp', False)
         self.scaler = GradScaler(enabled=self.use_amp)
 
@@ -168,6 +183,8 @@ class LiteExpertCL:
         self.merge_temperature = config.get('merge_temperature', 2.0)
         self.merge_distill_mae_epochs = config.get('merge_distill_mae_epochs', 200)
         self.merge_distill_cls_epochs = config.get('merge_distill_cls_epochs', 200)
+        self.merge_distill_np_epochs = config.get('merge_distill_np_epochs', 200)
+        self.merge_distill_np_samples = config.get('merge_distill_np_samples', 1000)
         self.merge_stats_weight = config.get('merge_stats_weight', 1.0)
 
         self.model = LiteModel().to(device)
@@ -177,6 +194,7 @@ class LiteExpertCL:
         self.expert_l2g = []   # expert_l2g[eid] = tensor [local_index -> global_class]
         self.expert_usage_count = []  # usage count from last Joint Test
         self.expert_stats = []  # {mean, var, n} of training embeddings per expert
+        self.expert_neighbor_stats = []  # {mean, var, n} of neighbor-enriched embeddings
 
         self.current_session = 0
 
@@ -192,7 +210,8 @@ class LiteExpertCL:
             torch.cuda.manual_seed(42)
 
         expert = LiteExpert(
-            self.input_dim, self.cls_hidden_dim, num_local_classes
+            self.input_dim, self.cls_hidden_dim, num_local_classes,
+            self.np_hidden_dim
         ).to(self.device)
 
         torch.random.set_rng_state(cpu_rng)
@@ -312,7 +331,7 @@ class LiteExpertCL:
 
     def _train_session(self, session_id, subgraph, train_idx, valid_idx,
                        curr_classes):
-        """Train one session's expert: Phase 1 classifier, Phase 2 MAE."""
+        """Train one session's expert: Phase 1 MAE, Phase 2 NP, Phase 3 Classifier."""
         # Build local class mapping: sorted for deterministic order
         sorted_classes = sorted(curr_classes)
         g2l = {c: i for i, c in enumerate(sorted_classes)}
@@ -342,14 +361,6 @@ class LiteExpertCL:
         # Pre-compute local labels for training nodes (only curr_classes nodes)
         train_indices = torch.where(loss_mask)[0]
 
-        # Record embedding statistics for pseudo data generation
-        with torch.no_grad():
-            h_train = h[train_indices]
-            self.expert_stats.append({
-                'mean': h_train.mean(dim=0),
-                'var': h_train.var(dim=0, correction=0),
-                'n': h_train.size(0),
-            })
         local_train_labels = torch.tensor(
             [g2l[labels[idx].item()] for idx in train_indices.tolist()],
             dtype=torch.long, device=self.device)
@@ -359,49 +370,7 @@ class LiteExpertCL:
 
         expert = self.model.experts[-1]
 
-        # ========== Phase 1: Classifier ==========
-        self._freeze_all()
-        for param in expert.classifier.parameters():
-            param.requires_grad = True
-
-        optimizer = optim.Adam(expert.classifier.parameters(),
-                               lr=self.cls_lr, weight_decay=self.cls_wd)
-        best_val = float('inf')
-        best_cls_state = None
-        patience_cnt = 0
-
-        pbar = tqdm(range(self.cls_epochs), desc=f"S{session_id} CLS")
-        for epoch in pbar:
-            self.model.train()
-            optimizer.zero_grad()
-            with autocast(enabled=self.use_amp):
-                logits = expert.classifier(h[train_indices])
-                loss = F.cross_entropy(logits, local_train_labels)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
-
-            if epoch > 0 and epoch % valid_ep == 0:
-                val_loss = self._validate_cls(
-                    expert, h, labels, valid_idx, curr_classes, g2l)
-                if val_loss < best_val:
-                    best_val = val_loss
-                    patience_cnt = 0
-                    best_cls_state = {k: v.cpu().clone()
-                                      for k, v in expert.classifier.state_dict().items()}
-                else:
-                    patience_cnt += 1
-                    if patience_cnt > patience:
-                        break
-                pbar.set_postfix(loss=f'{loss.item():.4f}', val=f'{val_loss:.4f}')
-            else:
-                pbar.set_postfix(loss=f'{loss.item():.4f}')
-
-        if best_cls_state is not None:
-            expert.classifier.load_state_dict(
-                {k: v.to(self.device) for k, v in best_cls_state.items()})
-
-        # ========== Phase 2: MAE (decoder + mask_token) ==========
+        # ========== Phase 1: MAE (decoder + mask_token) ==========
         self._freeze_all()
         for param in expert.mae_decoder.parameters():
             param.requires_grad = True
@@ -479,6 +448,308 @@ class LiteExpertCL:
                 {k: v.to(self.device) for k, v in best_mae_state['decoder'].items()})
             expert.mask_token.data = best_mae_state['mask_token'].to(self.device)
 
+        # ========== Phase 2: Neighbor Predictor ==========
+        self._train_neighbor_predictor(
+            session_id, expert, h, subgraph, train_idx, train_mask,
+            valid_idx, valid_ep, patience)
+
+        # ========== Record Statistics ==========
+        with torch.no_grad():
+            h_train = h[train_indices]
+            self.expert_stats.append({
+                'mean': h_train.mean(dim=0),
+                'var': h_train.var(dim=0, correction=0),
+                'n': h_train.size(0),
+            })
+            neighbor_stats = self._compute_enriched_stats(expert, h_train)
+            self.expert_neighbor_stats.append(neighbor_stats)
+
+        # ========== Phase 3: Classifier ==========
+        self._freeze_all()
+        for param in expert.classifier.parameters():
+            param.requires_grad = True
+
+        optimizer = optim.Adam(expert.classifier.parameters(),
+                               lr=self.cls_lr, weight_decay=self.cls_wd)
+        best_val = float('inf')
+        best_cls_state = None
+        patience_cnt = 0
+
+        pbar = tqdm(range(self.cls_epochs), desc=f"S{session_id} CLS")
+        for epoch in pbar:
+            self.model.train()
+            optimizer.zero_grad()
+            with autocast(enabled=self.use_amp):
+                logits = expert.classifier(h[train_indices])
+                loss = F.cross_entropy(logits, local_train_labels)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
+
+            if epoch > 0 and epoch % valid_ep == 0:
+                val_loss = self._validate_cls(
+                    expert, h, labels, valid_idx, curr_classes, g2l)
+                if val_loss < best_val:
+                    best_val = val_loss
+                    patience_cnt = 0
+                    best_cls_state = {k: v.cpu().clone()
+                                      for k, v in expert.classifier.state_dict().items()}
+                else:
+                    patience_cnt += 1
+                    if patience_cnt > patience:
+                        break
+                pbar.set_postfix(loss=f'{loss.item():.4f}', val=f'{val_loss:.4f}')
+            else:
+                pbar.set_postfix(loss=f'{loss.item():.4f}')
+
+        if best_cls_state is not None:
+            expert.classifier.load_state_dict(
+                {k: v.to(self.device) for k, v in best_cls_state.items()})
+
+    # ==================== Neighbor Predictor Helpers ====================
+
+    def _train_neighbor_predictor(self, session_id, expert, h, subgraph,
+                                  train_idx, train_mask, valid_idx,
+                                  valid_ep, patience):
+        """Phase 2: Train neighbor predictor on edges with at least one training node."""
+        self._freeze_all()
+        for param in expert.neighbor_predictor.parameters():
+            param.requires_grad = True
+
+        edge_index = subgraph['edge_index_no_selfloop'].to(self.device)
+        src, dst = edge_index[0], edge_index[1]
+        has_train = train_mask[src] | train_mask[dst]
+        filt_src = src[has_train]
+        filt_dst = dst[has_train]
+        keep = filt_src < filt_dst
+        pos_src = filt_src[keep]
+        pos_dst = filt_dst[keep]
+        num_pos = pos_src.size(0)
+
+        if num_pos == 0:
+            print(f"  NP: No positive edges found, skipping")
+            return
+
+        lo = torch.min(src, dst)
+        hi = torch.max(src, dst)
+        edge_pairs = torch.stack([lo, hi], dim=1).cpu()
+        edge_pairs = torch.unique(edge_pairs, dim=0)
+        all_edge_set = set(map(tuple, edge_pairs.tolist()))
+
+        all_nodes_list = subgraph['all_nodes']
+        train_idx_list = list(train_idx)
+
+        optimizer = optim.Adam(expert.neighbor_predictor.parameters(),
+                               lr=self.np_lr, weight_decay=self.np_wd)
+        best_val = float('inf')
+        best_np_state = None
+        patience_cnt = 0
+
+        pbar = tqdm(range(self.np_epochs), desc=f"S{session_id} NP")
+        for epoch in pbar:
+            expert.neighbor_predictor.train()
+
+            num_neg = self.np_neg_ratio * num_pos
+            neg_src, neg_dst = self._sample_negative_edges(
+                all_edge_set, train_idx_list, all_nodes_list, num_neg)
+
+            all_src = torch.cat([pos_src, neg_src])
+            all_dst = torch.cat([pos_dst, neg_dst])
+            all_labels = torch.cat([
+                torch.ones(num_pos, device=self.device),
+                torch.zeros(neg_src.size(0), device=self.device)
+            ])
+
+            perm = torch.randperm(all_src.size(0), device=self.device)
+            all_src = all_src[perm]
+            all_dst = all_dst[perm]
+            all_labels = all_labels[perm]
+
+            with autocast(enabled=self.use_amp):
+                edge_emb = self._compute_edge_embedding(h, all_src, all_dst)
+                logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
+                loss = F.binary_cross_entropy_with_logits(logits, all_labels)
+
+            optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
+
+            if epoch > 0 and epoch % valid_ep == 0:
+                val_loss = self._validate_np(expert, h, subgraph, valid_idx)
+                if val_loss < best_val:
+                    best_val = val_loss
+                    patience_cnt = 0
+                    best_np_state = {k: v.cpu().clone()
+                                     for k, v in expert.neighbor_predictor.state_dict().items()}
+                else:
+                    patience_cnt += 1
+                    if patience_cnt > patience:
+                        break
+                pbar.set_postfix(loss=f'{loss.item():.4f}', val=f'{val_loss:.4f}')
+            else:
+                pbar.set_postfix(loss=f'{loss.item():.4f}')
+
+        if best_np_state is not None:
+            expert.neighbor_predictor.load_state_dict(
+                {k: v.to(self.device) for k, v in best_np_state.items()})
+
+        print(f"  NP: Trained on {num_pos} positive edges")
+
+    def _sample_negative_edges(self, all_edge_set, train_idx_list,
+                               all_nodes_list, num_neg):
+        """Sample negative edges: at least one in train_idx, no real edge, (a,b)=(b,a)."""
+        device = self.device
+        neg_set = set()
+        neg_src_list = []
+        neg_dst_list = []
+
+        n_train = len(train_idx_list)
+        n_all = len(all_nodes_list)
+
+        for _ in range(50):
+            if len(neg_src_list) >= num_neg:
+                break
+            remain = (num_neg - len(neg_src_list)) * 3
+            a_idx = torch.randint(n_train, (remain,))
+            b_idx = torch.randint(n_all, (remain,))
+
+            for i in range(remain):
+                ai = train_idx_list[a_idx[i].item()]
+                bi = all_nodes_list[b_idx[i].item()]
+                if ai == bi:
+                    continue
+                edge = (min(ai, bi), max(ai, bi))
+                if edge in all_edge_set or edge in neg_set:
+                    continue
+                neg_set.add(edge)
+                neg_src_list.append(edge[0])
+                neg_dst_list.append(edge[1])
+                if len(neg_src_list) >= num_neg:
+                    break
+
+        return (torch.tensor(neg_src_list, dtype=torch.long, device=device),
+                torch.tensor(neg_dst_list, dtype=torch.long, device=device))
+
+    def _compute_edge_embedding(self, h, src, dst):
+        """Edge embedding: concat(h[src]+h[dst], h[src]*h[dst])."""
+        h_src = h[src]
+        h_dst = h[dst]
+        return torch.cat([h_src + h_dst, h_src * h_dst], dim=-1)
+
+    def _compute_enriched_embedding(self, expert, h_batch):
+        """Compute neighbor-enriched embeddings using streaming top-k (memory-friendly).
+
+        Instead of materializing an (n, n) probability matrix, computes
+        pairwise probabilities in (row_chunk, col_chunk) tiles and maintains
+        a running top-k per row, keeping peak memory at O(row_chunk * col_chunk).
+        """
+        n = h_batch.size(0)
+        k = min(max(1, int(self.np_topk_ratio * n)), n - 1)
+        if k <= 0:
+            return h_batch
+
+        row_chunk = self.np_enriched_row_chunk
+        col_chunk = self.np_enriched_col_chunk
+        device = h_batch.device
+
+        topk_probs = torch.full((n, k), -1.0, device=device)
+        topk_indices = torch.zeros((n, k), dtype=torch.long, device=device)
+
+        for r_start in range(0, n, row_chunk):
+            r_end = min(r_start + row_chunk, n)
+            h_i = h_batch[r_start:r_end]  # (rc, D)
+            rc = r_end - r_start
+
+            cur_probs = topk_probs[r_start:r_end]    # (rc, k)
+            cur_idx = topk_indices[r_start:r_end]     # (rc, k)
+
+            for c_start in range(0, n, col_chunk):
+                c_end = min(c_start + col_chunk, n)
+                h_j = h_batch[c_start:c_end]  # (cc, D)
+                cc = c_end - c_start
+
+                sum_emb = h_i.unsqueeze(1) + h_j.unsqueeze(0)  # (rc, cc, D)
+                had_emb = h_i.unsqueeze(1) * h_j.unsqueeze(0)  # (rc, cc, D)
+                edge_emb = torch.cat([sum_emb, had_emb], dim=2)
+
+                logits = expert.neighbor_predictor(
+                    edge_emb.reshape(rc * cc, -1)).squeeze(-1)
+                tile_probs = torch.sigmoid(logits).reshape(rc, cc)
+
+                # zero out diagonal entries (self-loops) — non-inplace for autograd safety
+                if r_start < c_end and c_start < r_end:
+                    ov_r0 = max(r_start, c_start) - r_start
+                    ov_c0 = max(r_start, c_start) - c_start
+                    ov_len = min(r_end, c_end) - max(r_start, c_start)
+                    if ov_len > 0:
+                        diag_r = torch.arange(ov_r0, ov_r0 + ov_len, device=device)
+                        diag_c = torch.arange(ov_c0, ov_c0 + ov_len, device=device)
+                        diag_mask = torch.zeros(rc, cc, dtype=torch.bool, device=device)
+                        diag_mask[diag_r, diag_c] = True
+                        tile_probs = tile_probs.masked_fill(diag_mask, 0.0)
+
+                col_global = torch.arange(c_start, c_end, device=device).unsqueeze(0).expand(rc, -1)
+
+                merged_probs = torch.cat([cur_probs, tile_probs], dim=1)   # (rc, k+cc)
+                merged_idx = torch.cat([cur_idx, col_global], dim=1)       # (rc, k+cc)
+
+                sel_k = min(k, merged_probs.size(1))
+                new_probs, pick = merged_probs.topk(sel_k, dim=1)
+                cur_probs = new_probs
+                cur_idx = merged_idx.gather(1, pick)
+
+            topk_probs[r_start:r_end] = cur_probs
+            topk_indices[r_start:r_end] = cur_idx
+
+        neighbor_agg = torch.zeros_like(h_batch)                    # (n, D)
+        for r_start in range(0, n, row_chunk):
+            r_end = min(r_start + row_chunk, n)
+            chunk_emb = h_batch[topk_indices[r_start:r_end]]     # (rc, k, D)
+            chunk_w = topk_probs[r_start:r_end].unsqueeze(-1)    # (rc, k, 1)
+            neighbor_agg[r_start:r_end] = (chunk_w * chunk_emb).sum(dim=1) / k
+        return neighbor_agg + h_batch
+
+    @torch.no_grad()
+    def _compute_enriched_stats(self, expert, h_train):
+        """Compute mean/var of neighbor-enriched embeddings for training nodes."""
+        expert.neighbor_predictor.eval()
+        enriched = self._compute_enriched_embedding(expert, h_train)
+        return {
+            'mean': enriched.mean(dim=0),
+            'var': enriched.var(dim=0, correction=0),
+            'n': h_train.size(0),
+        }
+
+    @torch.no_grad()
+    def _validate_np(self, expert, h, subgraph, valid_idx):
+        """Validate NP on edges involving validation nodes."""
+        expert.neighbor_predictor.eval()
+        edge_index = subgraph['edge_index_no_selfloop'].to(self.device)
+        src, dst = edge_index[0], edge_index[1]
+
+        valid_mask = torch.zeros(h.size(0), dtype=torch.bool, device=self.device)
+        for idx in valid_idx:
+            valid_mask[idx] = True
+
+        has_valid = valid_mask[src] | valid_mask[dst]
+        filt_src = src[has_valid]
+        filt_dst = dst[has_valid]
+        keep = filt_src < filt_dst
+        pos_src = filt_src[keep]
+        pos_dst = filt_dst[keep]
+
+        if pos_src.size(0) == 0:
+            return float('inf')
+
+        with autocast(enabled=self.use_amp):
+            edge_emb = self._compute_edge_embedding(h, pos_src, pos_dst)
+            logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
+            labels = torch.ones_like(logits)
+            val_loss = F.binary_cross_entropy_with_logits(logits, labels)
+
+        return val_loss.item()
+
     # ==================== Expert Merging ====================
 
     def _merge_least_used_experts(self):
@@ -515,8 +786,12 @@ class LiteExpertCL:
         # Step 1: Generate pseudo data for each expert (per-class count)
         stats_a = self.expert_stats[idx_a]
         stats_b = self.expert_stats[idx_b]
-        pseudo_a = self._generate_pseudo_data(expert_a, len(classes_a), stats_a, tag="A")
-        pseudo_b = self._generate_pseudo_data(expert_b, len(classes_b), stats_b, tag="B")
+        neighbor_stats_a = self.expert_neighbor_stats[idx_a]
+        neighbor_stats_b = self.expert_neighbor_stats[idx_b]
+        pseudo_a = self._generate_pseudo_data(
+            expert_a, len(classes_a), stats_a, neighbor_stats_a, tag="A")
+        pseudo_b = self._generate_pseudo_data(
+            expert_b, len(classes_b), stats_b, neighbor_stats_b, tag="B")
 
         # Step 2: Build soft labels with temperature scaling
         T = self.merge_temperature
@@ -543,7 +818,8 @@ class LiteExpertCL:
 
         # Step 3: Create merged expert with averaged initial weights
         merged_expert = LiteExpert(
-            self.input_dim, self.cls_hidden_dim, num_merged
+            self.input_dim, self.cls_hidden_dim, num_merged,
+            self.np_hidden_dim
         ).to(self.device)
 
         self._init_merged_weights(merged_expert, expert_a, expert_b,
@@ -552,6 +828,9 @@ class LiteExpertCL:
 
         self._distill_mae(merged_expert, all_pseudo)
         self._distill_classifier(merged_expert, all_pseudo, all_soft_labels)
+        self._distill_neighbor_predictor(
+            merged_expert, expert_a, expert_b,
+            pseudo_a, pseudo_b, len(classes_a), len(classes_b))
 
         # Step 4: Compute merged stats for the new expert
         n_a, n_b = stats_a['n'], stats_b['n']
@@ -561,6 +840,13 @@ class LiteExpertCL:
                    + n_b * (stats_b['var'] + stats_b['mean'] ** 2)) / n_ab
                   - mean_ab ** 2)
 
+        neighbor_mean_ab = (n_a * neighbor_stats_a['mean']
+                            + n_b * neighbor_stats_b['mean']) / n_ab
+        neighbor_var_ab = (
+            (n_a * (neighbor_stats_a['var'] + neighbor_stats_a['mean'] ** 2)
+             + n_b * (neighbor_stats_b['var'] + neighbor_stats_b['mean'] ** 2))
+            / n_ab - neighbor_mean_ab ** 2)
+
         # Step 5: Remove old experts (reverse order to preserve indices)
         for idx in sorted([idx_a, idx_b], reverse=True):
             del self.model.experts[idx]
@@ -568,6 +854,7 @@ class LiteExpertCL:
             del self.expert_l2g[idx]
             del self.expert_usage_count[idx]
             del self.expert_stats[idx]
+            del self.expert_neighbor_stats[idx]
 
         # Step 6: Add merged expert
         self.model.experts.append(merged_expert)
@@ -575,6 +862,8 @@ class LiteExpertCL:
         self.expert_l2g.append(merged_l2g)
         self.expert_usage_count.append(0)
         self.expert_stats.append({'mean': mean_ab, 'var': var_ab, 'n': n_ab})
+        self.expert_neighbor_stats.append({
+            'mean': neighbor_mean_ab, 'var': neighbor_var_ab, 'n': n_ab})
 
         print(f"  -> Merged expert manages classes {merged_classes} "
               f"(total experts: {len(self.model.experts)})")
@@ -625,7 +914,33 @@ class LiteExpertCL:
             alpha * expert_a.mask_token.data
             + (1 - alpha) * expert_b.mask_token.data)
 
-    def _generate_pseudo_data(self, expert, num_classes, stats, tag=""):
+        # ── Neighbor Predictor alignment ──
+        np_wa1 = expert_a.neighbor_predictor[0].weight.data  # [np_hidden, 2D]
+        np_wb1 = expert_b.neighbor_predictor[0].weight.data
+        np_ba1 = expert_a.neighbor_predictor[0].bias.data    # [np_hidden]
+        np_bb1 = expert_b.neighbor_predictor[0].bias.data
+        np_wa2 = expert_a.neighbor_predictor[2].weight.data  # [1, np_hidden]
+        np_wb2 = expert_b.neighbor_predictor[2].weight.data
+
+        cost_np = torch.cdist(np_wa1, np_wb1, p=2) ** 2
+        cost_np += torch.cdist(np_ba1.unsqueeze(1), np_bb1.unsqueeze(1), p=2) ** 2
+        cost_np += torch.cdist(np_wa2.t(), np_wb2.t(), p=2) ** 2
+
+        _, col_np = linear_sum_assignment(cost_np.cpu().numpy())
+        pm_np = torch.tensor(col_np, device=self.device, dtype=torch.long)
+
+        merged.neighbor_predictor[0].weight.data.copy_(
+            alpha * np_wa1 + (1 - alpha) * np_wb1[pm_np])
+        merged.neighbor_predictor[0].bias.data.copy_(
+            alpha * np_ba1 + (1 - alpha) * np_bb1[pm_np])
+        merged.neighbor_predictor[2].weight.data.copy_(
+            alpha * np_wa2 + (1 - alpha) * np_wb2[:, pm_np])
+        merged.neighbor_predictor[2].bias.data.copy_(
+            alpha * expert_a.neighbor_predictor[2].bias.data
+            + (1 - alpha) * expert_b.neighbor_predictor[2].bias.data)
+
+    def _generate_pseudo_data(self, expert, num_classes, stats,
+                              neighbor_stats, tag=""):
         """Optimize random data to minimize MAE recon + entropy + balance + stats match."""
         expert.eval()
         for p in expert.parameters():
@@ -633,6 +948,10 @@ class LiteExpertCL:
 
         target_mean = stats['mean'].detach()
         target_var = stats['var'].detach()
+        target_neighbor_mean = (neighbor_stats['mean'].detach()
+                                if neighbor_stats is not None else None)
+        target_neighbor_var = (neighbor_stats['var'].detach()
+                               if neighbor_stats is not None else None)
 
         n = num_classes * self.merge_pseudo_samples
         h_fake = torch.randn(n, self.input_dim, device=self.device,
@@ -671,10 +990,21 @@ class LiteExpertCL:
             loss_stats = (F.mse_loss(fake_mean, target_mean)
                           + F.mse_loss(fake_var, target_var))
 
+            loss_neighbor = torch.tensor(0.0, device=self.device)
+            if target_neighbor_mean is not None:
+                enriched_fake = self._compute_enriched_embedding(
+                    expert, h_fake)
+                fake_neighbor_mean = enriched_fake.mean(dim=0)
+                fake_neighbor_var = enriched_fake.var(dim=0, correction=0)
+                loss_neighbor = (
+                    F.mse_loss(fake_neighbor_mean, target_neighbor_mean)
+                    + F.mse_loss(fake_neighbor_var, target_neighbor_var))
+
             loss = (loss_mae
                     + self.merge_entropy_weight * loss_entropy
                     + self.merge_diversity_weight * loss_diversity
-                    + self.merge_stats_weight * loss_stats)
+                    + self.merge_stats_weight * loss_stats
+                    + self.neighbor_stats_weight * loss_neighbor)
             loss.backward()
             optimizer.step()
 
@@ -682,7 +1012,8 @@ class LiteExpertCL:
                 pbar.set_postfix(mae=f'{loss_mae.item():.4f}',
                                  ent=f'{loss_entropy.item():.4f}',
                                  bal=f'{loss_diversity.item():.4f}',
-                                 stat=f'{loss_stats.item():.4f}')
+                                 stat=f'{loss_stats.item():.4f}',
+                                 nei=f'{loss_neighbor.item():.4f}')
 
         return h_fake.detach()
 
@@ -741,6 +1072,72 @@ class LiteExpertCL:
             logits = merged_expert.classifier(pseudo_data) / T
             log_probs = F.log_softmax(logits, dim=1)
             loss = -(soft_labels * log_probs).sum(dim=1).mean() * (T ** 2)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 50 == 0:
+                pbar.set_postfix(loss=f'{loss.item():.4f}')
+
+    def _distill_neighbor_predictor(self, merged_expert, expert_a, expert_b,
+                                    pseudo_a, pseudo_b,
+                                    num_classes_a, num_classes_b):
+        """Distill merged NP using soft targets from original experts' NPs.
+
+        Per epoch, sample n_a pairs from pseudo_a and n_b pairs from pseudo_b,
+        where n_a/n_b ∝ x²/y² (x, y = number of classes each expert manages).
+        """
+        for p in merged_expert.neighbor_predictor.parameters():
+            p.requires_grad = True
+
+        optimizer = optim.Adam(merged_expert.neighbor_predictor.parameters(),
+                               lr=self.np_lr, weight_decay=self.np_wd)
+
+        x2 = num_classes_a ** 2
+        y2 = num_classes_b ** 2
+        total_sq = x2 + y2
+        n = self.merge_distill_np_samples
+        n_a = max(1, round(n * x2 / total_sq))
+        n_b = max(1, round(n * y2 / total_sq))
+
+        m_a = pseudo_a.size(0)
+        m_b = pseudo_b.size(0)
+
+        pbar = tqdm(range(self.merge_distill_np_epochs), desc="  DistillNP")
+        for epoch in pbar:
+            merged_expert.neighbor_predictor.train()
+
+            # Sample distinct pairs from A
+            idx_a1 = torch.randint(m_a, (n_a,), device=self.device)
+            idx_a2 = torch.randint(m_a - 1, (n_a,), device=self.device)
+            idx_a2 = idx_a2 + (idx_a2 >= idx_a1).long()
+
+            # Sample distinct pairs from B
+            idx_b1 = torch.randint(m_b, (n_b,), device=self.device)
+            idx_b2 = torch.randint(m_b - 1, (n_b,), device=self.device)
+            idx_b2 = idx_b2 + (idx_b2 >= idx_b1).long()
+
+            # Edge embeddings from fixed pseudo data
+            edge_emb_a = self._compute_edge_embedding(pseudo_a, idx_a1, idx_a2)
+            edge_emb_b = self._compute_edge_embedding(pseudo_b, idx_b1, idx_b2)
+
+            # Soft targets from original experts (no grad)
+            with torch.no_grad():
+                target_probs_a = torch.sigmoid(
+                    expert_a.neighbor_predictor(edge_emb_a).squeeze(-1))
+                target_probs_b = torch.sigmoid(
+                    expert_b.neighbor_predictor(edge_emb_b).squeeze(-1))
+
+            # Merged NP predictions
+            merged_probs_a = torch.sigmoid(
+                merged_expert.neighbor_predictor(edge_emb_a).squeeze(-1))
+            merged_probs_b = torch.sigmoid(
+                merged_expert.neighbor_predictor(edge_emb_b).squeeze(-1))
+
+            all_merged = torch.cat([merged_probs_a, merged_probs_b])
+            all_target = torch.cat([target_probs_a, target_probs_b])
+            loss = F.binary_cross_entropy(all_merged, all_target)
 
             optimizer.zero_grad()
             loss.backward()

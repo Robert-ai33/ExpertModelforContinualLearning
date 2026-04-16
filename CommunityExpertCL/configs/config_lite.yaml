@@ -10,10 +10,10 @@ default:
   split_v: 1
 
   # --- Expert Parameters ---
-  max_experts: 8            # merge when reaching this capacity
+  max_experts: 10            # merge when reaching this capacity
 
   # --- Parameter-free GCN ---
-  gcn_layers: 1           # number of message-passing hops
+  gcn_layers: 2           # number of message-passing hops
 
   # --- Classifier ---
   cls_hidden_dim: 256
@@ -30,6 +30,15 @@ default:
   pearson_weight: 0.3
   norm_ratio_weight: 0.3
 
+  # --- Neighbor Predictor ---
+  np_hidden_dim: 256
+  np_epochs: 200
+  np_lr: 1.0e-3
+  np_weight_decay: 1.0e-4
+  np_neg_ratio: 1
+  np_topk_ratio: 0.05
+  neighbor_stats_weight: 0.5
+
   # --- Training ---
   batch_size: 256
   valid_epoch: 10
@@ -37,15 +46,17 @@ default:
   infer_batch_size: 4096
 
   # --- Expert Merging ---
-  merge_pseudo_samples: 1000    # number of pseudo data points per expert
+  merge_pseudo_samples: 50     # number of pseudo data points per expert
   merge_pseudo_steps: 300      # optimization steps for pseudo data generation
   merge_pseudo_lr: 0.05         # Adam lr for pseudo data optimization
   merge_entropy_weight: 0.1    # weight for classifier entropy loss
   merge_diversity_weight: 0.1  # weight for pairwise diversity loss
   merge_temperature: 1.5       # temperature T for soft label distillation
   merge_stats_weight: 1       # weight for mean/var matching loss
-  merge_distill_mae_epochs: 200
-  merge_distill_cls_epochs: 200
+  merge_distill_mae_epochs: 100
+  merge_distill_cls_epochs: 100
+  merge_distill_np_epochs: 100
+  merge_distill_np_samples: 300   # node pairs per epoch for NP distillation
 
   # --- Debug ---
   debug: true

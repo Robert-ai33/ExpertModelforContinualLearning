@@ -167,20 +167,20 @@ class TaskLoader:
         edges_to_target = target_mask[dst]
         connected_edges = edges_from_target | edges_to_target
 
-        neighbor_nodes = set()
-        for i in torch.where(connected_edges)[0].tolist():
-            neighbor_nodes.add(src[i].item())
-            neighbor_nodes.add(dst[i].item())
-
-        external_neighbors = neighbor_nodes - target_idx_set
+        connected_src = src[connected_edges]
+        connected_dst = dst[connected_edges]
+        neighbor_ids = torch.cat([connected_src, connected_dst]).unique()
+        external_mask = ~target_mask[neighbor_ids]
+        external_ids = neighbor_ids[external_mask]
 
         if allowed_external_classes is not None:
-            allowed_nodes = set()
+            allowed_mask = torch.zeros(num_nodes, dtype=torch.bool)
             for cls in allowed_external_classes:
                 if cls in self.id_by_class:
-                    allowed_nodes.update(self.id_by_class[cls])
-            external_neighbors = external_neighbors & allowed_nodes
+                    allowed_mask[self.id_by_class[cls]] = True
+            external_ids = external_ids[allowed_mask[external_ids]]
 
+        external_neighbors = set(external_ids.tolist())
         all_nodes = target_idx_set | external_neighbors
         all_nodes_list = sorted(all_nodes)
 
