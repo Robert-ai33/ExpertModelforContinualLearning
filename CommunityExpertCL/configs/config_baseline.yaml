@@ -69,3 +69,24 @@ default:
   delome_hidden_dim: 256
   delome_cls_balance: logita
 
+  # --- SEED (multi-expert + per-class GMM + Bayes ensemble) ---
+  # Default to a compact 64-d embedding so that per-class GMMs are
+  # tractable on graph datasets whose classes often have only tens of
+  # training nodes.  Override seed_hidden_dim / seed_feat_dim per dataset
+  # if you have room.
+  seed_hidden_dim: 64
+  seed_feat_dim: 64
+  seed_nepochs: 200          # epochs for training a fresh expert
+  seed_ftepochs: 100         # epochs when finetuning an existing expert
+  seed_lr: 0.005
+  seed_weight_decay: 5.0e-4
+  seed_ftwd: 0.0
+  seed_clipgrad: 10000.0
+  seed_max_experts: 17        # cap on backbones held concurrently
+  seed_gmms: 1               # mixture components per class (k=1 = one Gaussian)
+  seed_alpha: 0.99           # weight of MSE feature-KD during finetune
+  seed_tau: 3.0              # softmax temperature for Bayes aggregation
+  seed_use_multivariate: false  # full-cov GMM (needs many samples); keep off by default
+  seed_use_nmc: false        # nearest-mean classifier instead of Bayes
+  seed_init_strategy: random  # 'first' copies expert-0 backbone, 'random' fresh init
+

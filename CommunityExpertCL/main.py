@@ -15,14 +15,14 @@ import numpy as np
 import torch
 
 from data import GraphDataset, TaskLoader
-from models import LiteExpertCL, BaselineCL
+from models import LiteExpertCL, BaselineCL, SEEDCL
 from utils import seed_everything
 
 
 # Dataset-specific experiment settings
 EXP_SETTINGS = {
     'cora': {
-        'class_splits': [[0, 1], [2, 3], [4, 5, 6]],
+        'class_splits': [[2,3], [0,1], [4, 5, 6]],
         'split_S': 5,
         'split_t': 3,
         'split_v': 1,
@@ -86,7 +86,7 @@ def main():
     parser.add_argument('--ntrials', type=int, default=5)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--method', type=str, default='lite',
-                        choices=['lite'] + BaselineCL.METHODS,
+                        choices=['lite', 'seed'] + BaselineCL.METHODS,
                         help='CL method to run (default: lite)')
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed precision training (AMP)')
@@ -98,6 +98,7 @@ def main():
     if args.method == 'lite':
         config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_lite.yaml')
     else:
+        # SEED and all other baselines share config_baseline.yaml
         config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_baseline.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         full_config = yaml.safe_load(f)
@@ -155,6 +156,12 @@ def main():
 
         if args.method == 'lite':
             model = LiteExpertCL(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+            )
+        elif args.method == 'seed':
+            model = SEEDCL(
                 task_loader=task_loader,
                 config=config,
                 device=device,

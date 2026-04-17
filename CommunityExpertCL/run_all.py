@@ -26,7 +26,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from data import GraphDataset, TaskLoader
-from models import LiteExpertCL, BaselineCL
+from models import LiteExpertCL, BaselineCL, SEEDCL
 from utils import seed_everything
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -35,14 +35,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 from main import EXP_SETTINGS
 
 ALL_METHODS = ['bare', 'ewc', 'mas', 'twp', 'lwf', 'gem', 'ergnn', 'cat',
-               'cosine', 'teen', 'delome', 'joint', 'lite']
-SUPPORTED_RUN_METHODS = [m for m in ALL_METHODS if m == 'lite' or m in BaselineCL.METHODS]
+               'cosine', 'teen', 'delome', 'seed', 'joint', 'lite']
+STANDALONE_METHODS = {'lite', 'seed'}
+SUPPORTED_RUN_METHODS = [m for m in ALL_METHODS
+                        if m in STANDALONE_METHODS or m in BaselineCL.METHODS]
 METHOD_LABELS = {
     'bare': 'BARE', 'ewc': 'EWC', 'mas': 'MAS',
     'twp': 'TWP', 'lwf': 'LwF', 'gem': 'GEM',
     'ergnn': 'ER-GNN', 'cat': 'CaT',
     'cosine': 'COSINE', 'teen': 'TEEN',
-    'delome': 'DeLoMe',
+    'delome': 'DeLoMe', 'seed': 'SEED',
     'joint': 'JOINT', 'lite': 'Ours',
 }
 METHOD_MARKERS = {
@@ -50,7 +52,8 @@ METHOD_MARKERS = {
     'twp': 'v', 'lwf': 'D', 'gem': 'P',
     'ergnn': '*', 'cat': 'X',
     'cosine': 'p', 'teen': 'h',
-    'delome': '>', 'joint': '<', 'lite': 'd',
+    'delome': '>', 'seed': '8',
+    'joint': '<', 'lite': 'd',
 }
 
 
@@ -63,6 +66,8 @@ def run_single_method(method, task_loader, config_lite, config_baseline, device,
 
         if method == 'lite':
             model = LiteExpertCL(task_loader=task_loader, config=config_lite, device=device)
+        elif method == 'seed':
+            model = SEEDCL(task_loader=task_loader, config=config_baseline, device=device)
         else:
             model = BaselineCL(task_loader=task_loader, config=config_baseline, device=device, method=method)
 
@@ -208,7 +213,8 @@ def main():
         methods = SUPPORTED_RUN_METHODS
     else:
         methods = [m.strip() for m in args.methods.split(',')]
-        unsupported = [m for m in methods if m != 'lite' and m not in BaselineCL.METHODS]
+        unsupported = [m for m in methods
+                       if m not in STANDALONE_METHODS and m not in BaselineCL.METHODS]
         if unsupported:
             raise ValueError(
                 f"Methods not yet runnable in this script: {unsupported}. "
