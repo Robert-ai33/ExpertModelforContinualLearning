@@ -1,0 +1,46 @@
+# MAERoutingOnlyCL Configuration
+# MAE-as-routing theoretical upper-bound ablation: warp + alpha-MLP + STE top-K
+# + decoder. One expert per session, no merging / no NP / no distillation.
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- Parameter-free GCN ---
+  gcn_layers: 2              # number of message-passing hops
+
+  # --- Classifier ---
+  cls_hidden_dim: 256
+  cls_epochs: 200
+  cls_lr: 0.01
+  cls_weight_decay: 5.0e-4
+
+  # --- MAE (warp + alpha + decoder) ---
+  mae_hidden_dim: 256        # hidden width of warp_mlp / alpha_mlp / decoder
+  mae_epochs: 200
+  mae_lr: 1.0e-3
+  mae_weight_decay: 1.0e-4
+  mask_ratio: 0.25           # fraction of dims to MASK (k_keep = D*(1-mask_ratio))
+  mae_gamma: 2
+  pearson_weight: 0.6
+  norm_ratio_weight: 0.3
+  # Ablation switch for the MAE objective used in training / validation /
+  # routing. Options:
+  #   joint -- default, scaled-cosine + pearson_weight*Pearson
+  #            + norm_ratio_weight*norm-ratio (the original three-term loss).
+  #   mse   -- plain F.mse_loss(recon, target); the two weights above are
+  #            ignored in this mode.
+  mae_loss: joint
+
+  # --- Training ---
+  batch_size: 256
+  valid_epoch: 10
+  patience: 9999
+  infer_batch_size: 4096
+
+  # --- Debug ---
+  debug: true

@@ -1,9 +1,20 @@
 """
 Task loader for CommunityExpertCL.
 
-Subgraph construction:
-- Training subgraph: target nodes + external neighbors from seen classes only (current + past)
-- Joint test subgraph: all seen classes, external neighbors restricted to seen classes only
+Subgraph construction (per session k):
+- ``subgraph_per_task[k]`` (training & per-task evaluation, CGLB protocol):
+    target nodes = all classes seen up to session k (cumulative);
+    external neighbors restricted to the same cumulative class set.
+    Used for both session-k training propagation **and** the per-task tests
+    that fill row k of the CL accuracy matrix -- cell (k, t) evaluates this
+    same cumulative graph on ``test_idx_per_task[t]``.
+- ``subgraph_joint[k]`` (joint Micro/Macro test): identical construction,
+    kept as a separate field for API clarity.
+- ``subgraph_isolated[k]`` (condensation only): target = session-k classes
+    only, no external neighbors. CaT/DeLoMe condensation in
+    ``baselines.py::_build_isolated_local_subgraph`` consumes this, matching
+    the original CaT/DeLoMe design where condensation runs on a task-local
+    graph. Not used for evaluation under the CGLB protocol.
 
 Data splitting per class:
 - train: ceil(N * t / S)

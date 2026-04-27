@@ -26,8 +26,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from data import GraphDataset, TaskLoader
-from models import LiteExpertCL, BaselineCL, SEEDCL
-from utils import seed_everything
+from models import LiteExpertCL, BaselineCL, SEEDCL, MAERoutingOnlyCL, ACILCL, TEMCL
+from utils import seed_everything, compute_ap_af
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -35,8 +35,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from main import EXP_SETTINGS
 
 ALL_METHODS = ['bare', 'ewc', 'mas', 'twp', 'lwf', 'gem', 'ergnn', 'cat',
-               'cosine', 'teen', 'delome', 'seed', 'joint', 'lite']
-STANDALONE_METHODS = {'lite', 'seed'}
+               'cosine', 'teen', 'delome', 'seed', 'acil', 'tem', 'joint',
+               'mae_routing', 'lite']
+STANDALONE_METHODS = {'lite', 'seed', 'mae_routing', 'acil', 'tem'}
 SUPPORTED_RUN_METHODS = [m for m in ALL_METHODS
                         if m in STANDALONE_METHODS or m in BaselineCL.METHODS]
 METHOD_LABELS = {
@@ -45,7 +46,9 @@ METHOD_LABELS = {
     'ergnn': 'ER-GNN', 'cat': 'CaT',
     'cosine': 'COSINE', 'teen': 'TEEN',
     'delome': 'DeLoMe', 'seed': 'SEED',
+    'acil': 'ACIL', 'tem': 'TEM',
     'joint': 'JOINT', 'lite': 'Ours',
+    'mae_routing': 'Manifold_MAE',
 }
 METHOD_MARKERS = {
     'bare': 'o', 'ewc': 's', 'mas': '^',
@@ -53,23 +56,45 @@ METHOD_MARKERS = {
     'ergnn': '*', 'cat': 'X',
     'cosine': 'p', 'teen': 'h',
     'delome': '>', 'seed': '8',
+    'acil': '+', 'tem': '2',
     'joint': '<', 'lite': 'd',
+    'mae_routing': '1',
 }
 
 
-def run_single_method(method, task_loader, config_lite, config_baseline, device, ntrials, seeds):
-    """Run one method for multiple trials, return averaged results."""
+def run_single_method(method, task_loader, configs, device, ntrials, seeds):
+    """Run one method for multiple trials, return averaged results.
+
+    ``configs`` is a dict keyed by standalone-method name (plus 'baseline' for
+    the shared BaselineCL/SEED config), e.g.
+        {'lite': ..., 'baseline': ..., 'mae_routing': ..., 'acil': ...}
+    """
     all_results = []
     for trial in range(ntrials):
         seed = seeds[trial]
         seed_everything(seed)
 
         if method == 'lite':
-            model = LiteExpertCL(task_loader=task_loader, config=config_lite, device=device)
+            model = LiteExpertCL(
+                task_loader=task_loader, config=configs['lite'], device=device)
+        elif method == 'mae_routing':
+            model = MAERoutingOnlyCL(
+                task_loader=task_loader, config=configs['mae_routing'],
+                device=device)
+        elif method == 'acil':
+            model = ACILCL(
+                task_loader=task_loader, config=configs['acil'], device=device)
+        elif method == 'tem':
+            model = TEMCL(
+                task_loader=task_loader, config=configs['tem'], device=device)
         elif method == 'seed':
-            model = SEEDCL(task_loader=task_loader, config=config_baseline, device=device)
+            model = SEEDCL(
+                task_loader=task_loader, config=configs['baseline'],
+                device=device)
         else:
-            model = BaselineCL(task_loader=task_loader, config=config_baseline, device=device, method=method)
+            model = BaselineCL(
+                task_loader=task_loader, config=configs['baseline'],
+                device=device, method=method)
 
         results = model.fit(trial)
         all_results.append(results)
@@ -87,10 +112,24 @@ def run_single_method(method, task_loader, config_lite, config_baseline, device,
             avg_row.append(np.mean(vals))
         avg_matrix.append(avg_row)
 
+    # AP / AF (CGLB convention): compute on the trial-averaged acc matrix so
+    # the reported numbers match the heatmap exactly. Per-trial std is also
+    # reported below for transparency.
+    ap_history, af, final_ap = compute_ap_af(avg_matrix)
+    per_trial_final_ap = [compute_ap_af(r['acc_matrix'])[2] for r in all_results]
+    per_trial_af = [compute_ap_af(r['acc_matrix'])[1] for r in all_results]
+    final_ap_std = float(np.std(per_trial_final_ap)) if len(per_trial_final_ap) > 1 else 0.0
+    af_std = float(np.std(per_trial_af)) if len(per_trial_af) > 1 else 0.0
+
     return {
         'joint_acc': avg_joint_acc,
         'joint_macro_acc': avg_joint_macro,
         'acc_matrix': avg_matrix,
+        'ap_history': ap_history,
+        'af': af,
+        'final_ap': final_ap,
+        'final_ap_std': final_ap_std,
+        'af_std': af_std,
     }
 
 
@@ -206,7 +245,6 @@ def main():
     parser.add_argument('--methods', type=str, default='all',
                         help='Comma-separated methods or "all"')
     parser.add_argument('--svd_dim', type=int, default=0)
-    parser.add_argument('--amp', action='store_true')
     args = parser.parse_args()
 
     if args.methods == 'all':
@@ -224,21 +262,28 @@ def main():
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     exp = EXP_SETTINGS[args.dataset]
 
-    # Load both configs
+    # Load all standalone-method configs + the shared baseline config.
     base_dir = os.path.dirname(__file__)
-    with open(os.path.join(base_dir, 'configs', 'config_lite.yaml'), 'r', encoding='utf-8') as f:
-        config_lite = yaml.safe_load(f)['default']
-    with open(os.path.join(base_dir, 'configs', 'config_baseline.yaml'), 'r', encoding='utf-8') as f:
-        config_baseline = yaml.safe_load(f)['default']
+    cfg_files = {
+        'lite': 'config_lite.yaml',
+        'baseline': 'config_baseline.yaml',
+        'mae_routing': 'config_mae_routing.yaml',
+        'acil': 'config_acil.yaml',
+        'tem': 'config_tem.yaml',
+    }
+    configs = {}
+    for key, fname in cfg_files.items():
+        with open(os.path.join(base_dir, 'configs', fname),
+                  'r', encoding='utf-8') as f:
+            configs[key] = yaml.safe_load(f)['default']
 
-    for cfg in [config_lite, config_baseline]:
+    for cfg in configs.values():
         cfg['class_splits'] = exp['class_splits']
         cfg['split_S'] = exp.get('split_S', cfg.get('split_S', 5))
         cfg['split_t'] = exp.get('split_t', cfg.get('split_t', 3))
         cfg['split_v'] = exp.get('split_v', cfg.get('split_v', 1))
-    config_lite['use_amp'] = args.amp
 
-    seeds = config_lite.get('seed', [0, 1, 2, 3, 4])
+    seeds = configs['lite'].get('seed', [0, 1, 2, 3, 4])
     ntrials = min(args.ntrials, len(seeds))
 
     out_dir = os.path.join(base_dir, 'results', 'comparison', args.dataset)
@@ -247,7 +292,7 @@ def main():
     seed_everything(seeds[0])
     graph_dataset = GraphDataset(args.dataset, args.data_path, svd_dim=args.svd_dim)
     task_loader = TaskLoader(
-        batch_size=config_lite.get('batch_size', 256),
+        batch_size=configs['lite'].get('batch_size', 256),
         graph_dataset=graph_dataset,
         class_splits=exp['class_splits'],
         split_S=exp.get('split_S', 5),
@@ -261,13 +306,15 @@ def main():
         print(f"  Running method: {METHOD_LABELS.get(method, method)}")
         print(f"{'#'*70}")
 
-        result = run_single_method(method, task_loader, config_lite, config_baseline,
+        result = run_single_method(method, task_loader, configs,
                                    device, ntrials, seeds)
         all_data[method] = result
 
         print(f"\n  [{METHOD_LABELS.get(method, method)}] "
               f"Final Joint Acc (micro): {result['joint_acc'][-1]:.4f}, "
-              f"(macro): {result['joint_macro_acc'][-1]:.4f}")
+              f"(macro): {result['joint_macro_acc'][-1]:.4f}, "
+              f"AP: {result['final_ap']:.4f}, "
+              f"AF: {result['af']:+.4f}")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -279,6 +326,11 @@ def main():
             'joint_acc': [float(v) for v in d['joint_acc']],
             'joint_macro_acc': [float(v) for v in d['joint_macro_acc']],
             'acc_matrix': [[float(v) for v in row] for row in d['acc_matrix']],
+            'ap_history': [float(v) for v in d.get('ap_history', [])],
+            'af': float(d.get('af', 0.0)),
+            'final_ap': float(d.get('final_ap', 0.0)),
+            'final_ap_std': float(d.get('final_ap_std', 0.0)),
+            'af_std': float(d.get('af_std', 0.0)),
         }
     with open(os.path.join(out_dir, 'results.json'), 'w') as f:
         json.dump(serializable, f, indent=2)
@@ -290,18 +342,53 @@ def main():
     plot_heatmaps(all_data, num_sessions, args.dataset, out_dir)
     plot_shared_legend(out_dir)
 
-    # Print final comparison table
-    print(f"\n{'='*70}")
+    # Print final comparison table (including CGLB AP / AF)
+    show_std = ntrials > 1
+    if show_std:
+        col_widths = (20, 14, 14, 18, 18)
+        header = (f"{'Method':<{col_widths[0]}} "
+                  f"{'Joint Micro':>{col_widths[1]}} "
+                  f"{'Joint Macro':>{col_widths[2]}} "
+                  f"{'AP (mean +/- std)':>{col_widths[3]}} "
+                  f"{'AF (mean +/- std)':>{col_widths[4]}}")
+    else:
+        col_widths = (20, 14, 14, 12, 12)
+        header = (f"{'Method':<{col_widths[0]}} "
+                  f"{'Joint Micro':>{col_widths[1]}} "
+                  f"{'Joint Macro':>{col_widths[2]}} "
+                  f"{'AP':>{col_widths[3]}} "
+                  f"{'AF':>{col_widths[4]}}")
+    width = sum(col_widths) + len(col_widths)
+
+    print(f"\n{'=' * max(70, width)}")
     print(f"COMPARISON TABLE ({args.dataset}, {ntrials} trial(s))")
-    print(f"{'='*70}")
-    print(f"{'Method':<20} {'Final Micro':>12} {'Final Macro':>12}")
-    print(f"{'-'*44}")
+    print("CL Matrix: CGLB protocol (cell (k,t) = subgraph_per_task[k] eval on test_idx[t])")
+    print(f"{'=' * max(70, width)}")
+    print(header)
+    print('-' * len(header))
     for method in methods:
-        if method in all_data:
-            label = METHOD_LABELS.get(method, method)
-            micro = all_data[method]['joint_acc'][-1]
-            macro = all_data[method]['joint_macro_acc'][-1]
-            print(f"{label:<20} {micro:>12.4f} {macro:>12.4f}")
+        if method not in all_data:
+            continue
+        label = METHOD_LABELS.get(method, method)
+        d = all_data[method]
+        micro = d['joint_acc'][-1]
+        macro = d['joint_macro_acc'][-1]
+        ap = d.get('final_ap', 0.0)
+        af = d.get('af', 0.0)
+        if show_std:
+            ap_str = f"{ap:.4f} +/- {d.get('final_ap_std', 0.0):.4f}"
+            af_str = f"{af:+.4f} +/- {d.get('af_std', 0.0):.4f}"
+            print(f"{label:<{col_widths[0]}} "
+                  f"{micro:>{col_widths[1]}.4f} "
+                  f"{macro:>{col_widths[2]}.4f} "
+                  f"{ap_str:>{col_widths[3]}} "
+                  f"{af_str:>{col_widths[4]}}")
+        else:
+            print(f"{label:<{col_widths[0]}} "
+                  f"{micro:>{col_widths[1]}.4f} "
+                  f"{macro:>{col_widths[2]}.4f} "
+                  f"{ap:>{col_widths[3]}.4f} "
+                  f"{af:>+{col_widths[4]}.4f}")
 
 
 if __name__ == '__main__':

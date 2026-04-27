@@ -1,12 +1,13 @@
 """
-Directed Expert-based Class-Incremental Continual Learning on WikiCS
+Directed Expert-based Class-Incremental Continual Learning
 
-Features:
-1. Directed and undirected graph support
-2. Classification expert: GCN + classifier on undirected graph
-3. Out-neighbor predictor: predicts A->B on directed graph
-4. In-neighbor predictor: predicts A<-B on directed graph
-5. Expert selection based on directed neighbor prediction accuracy
+Supported datasets: wikics, ogbn-arxiv
+Supported models: expert (DirectedExpertCL), naive_gcn (NaiveGCNCL)
+
+Usage:
+  python main.py --dataset wikics
+  python main.py --dataset wikics --model naive_gcn --config_path ./configs/config_naive_gcn.yaml
+  python main.py --dataset ogbn-arxiv --gpu 0
 """
 
 import os
@@ -15,17 +16,28 @@ import argparse
 import torch
 import numpy as np
 
-from data import WikiCSDataset, TaskLoader
-from models import DirectedExpertCL
+from data import GraphDataset, TaskLoader
+from models import DirectedExpertCL, NaiveGCNCL
 from utils import seed_everything, CLMetric
 
 
-# WikiCS: 10 classes, default split into 5 sessions
+# Default experiment settings per dataset
 exp_settings = {
-    'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
-    'train_shots': 200,
-    'valid_shots': 50,
-    'test_shots': 50,
+    'wikics': {
+        'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],
+        'train_shots': 200,
+        'valid_shots': 50,
+        'test_shots': 100,
+        'data_path': '../wiki-cs-dataset-master/dataset/',
+    },
+    'ogbn-arxiv': {
+        # 40 classes, split into 10 sessions (4 classes each)
+        'class_splits': [[0,1,2,3],[4,5,6,7],[8,9,10,11],[12,13,14,15],[16,17,18,19]],
+        'train_shots': 500,
+        'valid_shots': 100,
+        'test_shots': 200,
+        'data_path': './data_files/',
+    },
 }
 
 
@@ -39,29 +51,39 @@ def run_experiment(args, config):
     """Run a single experiment."""
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    # Use custom class_splits if provided
+    # Get dataset-specific settings
+    dataset_settings = exp_settings[args.dataset]
+
+    # Override with command-line arguments if provided
     if args.class_splits:
         class_splits = eval(args.class_splits)
     else:
-        class_splits = exp_settings['class_splits']
+        class_splits = dataset_settings['class_splits']
+
+    train_shots = args.train_shots if args.train_shots else dataset_settings['train_shots']
+    valid_shots = args.valid_shots if args.valid_shots else dataset_settings['valid_shots']
+    test_shots = args.test_shots if args.test_shots else dataset_settings['test_shots']
+    data_path = args.data_path if args.data_path else dataset_settings['data_path']
 
     print(f"\n{'='*60}")
-    print(f"Directed Expert CL on WikiCS")
+    print(f"Dataset: {args.dataset}")
+    print(f"Model: {args.model}")
     print(f"Class Splits: {class_splits}")
+    print(f"Train/Valid/Test shots: {train_shots}/{valid_shots}/{test_shots}")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
 
     # Load dataset
-    dataset = WikiCSDataset(data_path=args.data_path)
+    dataset = GraphDataset(dataset=args.dataset, data_path=data_path)
 
     # Create task loader
     task_loader = TaskLoader(
         batch_size=config['batch_size'],
         dataset=dataset,
         class_splits=class_splits,
-        train_shots=exp_settings['train_shots'],
-        valid_shots=exp_settings['valid_shots'],
-        test_shots=exp_settings['test_shots'],
+        train_shots=train_shots,
+        valid_shots=valid_shots,
+        test_shots=test_shots,
     )
 
     # Run trials
@@ -75,14 +97,24 @@ def run_experiment(args, config):
 
         result_logger = CLMetric()
 
-        model = DirectedExpertCL(
-            task_loader=task_loader,
-            result_logger=result_logger,
-            config=config,
-            checkpoint_path=args.ckpt_path,
-            seed=seed,
-            device=device,
-        )
+        if args.model == 'naive_gcn':
+            model = NaiveGCNCL(
+                task_loader=task_loader,
+                result_logger=result_logger,
+                config=config,
+                checkpoint_path=args.ckpt_path,
+                seed=seed,
+                device=device,
+            )
+        else:
+            model = DirectedExpertCL(
+                task_loader=task_loader,
+                result_logger=result_logger,
+                config=config,
+                checkpoint_path=args.ckpt_path,
+                seed=seed,
+                device=device,
+            )
 
         result_logger = model.fit(trial)
         avg_acc, avg_fgt, _, last_acc = result_logger.get_results()
@@ -96,7 +128,7 @@ def run_experiment(args, config):
 
     # Print final results
     print(f"\n{'='*60}")
-    print(f"Final Results ({args.ntrials} trials):")
+    print(f"[{args.dataset}] Final Results ({args.ntrials} trials):")
     print(f"  Avg ACC: {np.mean(results['avg_acc']):.4f} "
           f"+/- {np.std(results['avg_acc']):.4f}")
     print(f"  Avg FGT: {np.mean(results['avg_fgt']):.4f} "
@@ -110,19 +142,30 @@ def run_experiment(args, config):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Directed Expert CL on WikiCS'
+        description='Directed Expert CL on Graphs'
     )
 
     # Dataset
-    parser.add_argument('--data_path', type=str,
-                        default='../wiki-cs-dataset-master/dataset/',
-                        help='Path to WikiCS dataset directory (containing data.json)')
+    parser.add_argument('--dataset', type=str, default='wikics',
+                        choices=['wikics', 'ogbn-arxiv'],
+                        help='Dataset name')
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Path to dataset files (default: auto per dataset)')
 
-    # Class splits
+    # Class splits and data split sizes
     parser.add_argument('--class_splits', type=str, default=None,
                         help='Custom class splits, e.g., "[[0,1],[2,3],[4,5]]"')
+    parser.add_argument('--train_shots', type=int, default=None,
+                        help='Training samples per class')
+    parser.add_argument('--valid_shots', type=int, default=None,
+                        help='Validation samples per class')
+    parser.add_argument('--test_shots', type=int, default=None,
+                        help='Test samples per class')
 
     # Model
+    parser.add_argument('--model', type=str, default='expert',
+                        choices=['expert', 'naive_gcn'],
+                        help='Model type: expert (DirectedExpertCL) or naive_gcn (NaiveGCNCL)')
     parser.add_argument('--config_path', type=str,
                         default='./configs/config.yaml',
                         help='Path to config file')

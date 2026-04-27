@@ -48,10 +48,10 @@ exp_settings = {
         'test_shots': 50,
     },
     'coauthor-cs': {
-        'class_splits': [[0, 1],[2, 3], [4, 5], [6, 7, 8], [9, 10, 11],[12, 13, 14]],
+        'class_splits': [[0, 1],[2, 3], [4, 5], [6, 7], [8, 9],[10, 11], [12, 13, 14]],
         'train_shots': 200,
         'valid_shots': 50,
-        'test_shots': 100,
+        'test_shots': 200,
     },
     'amazon-computers': {
         'class_splits': [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]],

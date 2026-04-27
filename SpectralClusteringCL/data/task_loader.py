@@ -75,12 +75,13 @@ class TaskLoader:
                 node_idx = self.id_by_class[cla].copy()
                 node_num = len(node_idx)
 
-                if node_num < (self.train_shots + self.valid_shots + self.test_shots):
-                    train_num = int(node_num * 0.5)
-                    valid_num = int(node_num * 0.1)
-                    test_num = int(node_num * 0.4)
-                    if train_num + valid_num + test_num > node_num:
-                        train_num = node_num - valid_num - test_num
+                total_shots = self.train_shots + self.valid_shots + self.test_shots
+                if node_num < total_shots:
+                    train_num = int(node_num * self.train_shots / total_shots)
+                    valid_num = int(node_num * self.valid_shots / total_shots)
+                    test_num = int(node_num * self.test_shots / total_shots)
+                    remainder = node_num - train_num - valid_num - test_num
+                    train_num += remainder
                 else:
                     train_num = self.train_shots
                     valid_num = self.valid_shots

@@ -10,7 +10,7 @@ default:
   split_v: 1
 
   # --- Expert Parameters ---
-  max_experts: 10            # merge when reaching this capacity
+  max_experts: 17            # merge when reaching this capacity
 
   # --- Parameter-free GCN ---
   gcn_layers: 2           # number of message-passing hops
@@ -27,8 +27,15 @@ default:
   mae_weight_decay: 1.0e-4
   mask_ratio: 0.25
   mae_gamma: 2
-  pearson_weight: 0.3
+  pearson_weight: 0.6
   norm_ratio_weight: 0.3
+  # Ablation switch for the MAE objective used in training / validation /
+  # pseudo-data generation / expert routing. Options:
+  #   joint -- default, scaled-cosine + pearson_weight*Pearson
+  #            + norm_ratio_weight*norm-ratio (the original three-term loss).
+  #   mse   -- plain F.mse_loss(recon, target); the two weights above are
+  #            ignored in this mode.
+  mae_loss: joint
 
   # --- Neighbor Predictor ---
   np_hidden_dim: 256

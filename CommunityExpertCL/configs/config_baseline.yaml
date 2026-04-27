@@ -39,18 +39,23 @@ default:
   twp_beta: 0.01
 
   # --- ER-GNN ---
-  ergnn_budget: 50
+  ergnn_budget: 100
   ergnn_d: 0.5
   ergnn_replay_weight: 1.0
 
   # --- CaT (CGM) ---
-  cat_budget: 200
+  cat_budget: 400
   cat_n_encoders: 10
   cat_feat_lr: 0.01
   cat_hid_dim: 256
   cat_emb_dim: 128
   cat_n_layers: 2
   cat_hop: 1
+  cat_activation: true       # original Encoder.activation flag (ReLU between layers)
+  cat_tim: false             # true = CaT paper "Train In Memory" headline setting:
+                             #        each session trains only on condensed memory
+                             #        (current + past). false = memory_bank[:k]+[tasks[k]]
+                             #        non-TIM setting.
 
   # --- COSINE ---
   cosine_T: 16.0
@@ -61,21 +66,26 @@ default:
   teen_shift_weight: 0.1
 
   # --- DeLoMe ---
-  delome_budget: 50
+  delome_budget: 100
   delome_tro: 1.0
-  delome_condense_epochs: 200
+  delome_condense_epochs: 900   # original hard-codes self.epochs=900 in GCond
   delome_feat_lr: 0.0001
   delome_sgc_k: 2
-  delome_hidden_dim: 256
+  delome_hidden_dim: 256        # legacy single-hidden-dim knob (kept for compat)
+  delome_sgc_h_dims: [256]      # matches Backbones/gnns.py SGC_args['h_dims']
+  delome_sgc_bn: false          # original SGC_args['batch_norm'] default off
+  delome_sgc_dropout: 0.0       # original SGC_args['dropout'] default 0
+  delome_sgc_linear_bias: true  # original SGC_args['linear_bias']
   delome_cls_balance: logita
+  delome_condense_seed: 42      # original GCond.set_seed(42)
 
   # --- SEED (multi-expert + per-class GMM + Bayes ensemble) ---
   # Default to a compact 64-d embedding so that per-class GMMs are
   # tractable on graph datasets whose classes often have only tens of
   # training nodes.  Override seed_hidden_dim / seed_feat_dim per dataset
   # if you have room.
-  seed_hidden_dim: 64
-  seed_feat_dim: 64
+  seed_hidden_dim: 256
+  seed_feat_dim: 256
   seed_nepochs: 200          # epochs for training a fresh expert
   seed_ftepochs: 100         # epochs when finetuning an existing expert
   seed_lr: 0.005

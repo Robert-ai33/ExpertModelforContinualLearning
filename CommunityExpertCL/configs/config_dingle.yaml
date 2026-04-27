@@ -1,0 +1,63 @@
+# DINGLE Configuration
+# DINGLE: Disentangled Knowledge Distillation for Graph Class-Incremental Learning
+#
+# Hyperparameter naming follows the original DINGLE-main release:
+#   hidden_feature   = GCN output dim = DisModel input dim   (default 256)
+#   semantic_feature = MLP intermediate dim inside DisModel  (default 64)
+#   output_dim       = z_c / z_s dim                         (default 64)
+#   enc/dec/dis_layer= depth of the four MLPs in DisModel    (default 2)
+#
+# The original config_*_stream.yaml from DINGLE is not bundled with the
+# release; the values below mirror the DINGLE main.py CLI defaults
+# (lr=0.001, ft_lr=0.0001, weight_decay=5e-4, episodes=200, ft_episodes=200)
+# and the ``DisModel(... batch_norm=False)`` instantiation used in the
+# original main script.
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting (shared with other baselines) ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  batch_size: 256
+
+  # --- GCN Backbone ---
+  gcn_hidden_dim: 256
+  gcn_layers: 2
+  gcn_dropout: 0.0
+
+  # --- DisModel geometry (faithful to dis_model.DisModel signature) ---
+  dingle_hidden_feature: 256   # GCN output dim, fed into DisModel as input_dim
+  dingle_semantic_feature: 64  # MLP intermediate dim inside DisModel
+  dingle_output_dim: 64        # z_c / z_s dim
+  dingle_enc_layer: 2          # E_c / E_s depth
+  dingle_dec_layer: 2          # D depth
+  dingle_dis_layer: 2          # Discriminator depth
+  dingle_batch_norm: false     # original main.py passes batch_norm=False
+
+  # --- Training schedule ---
+  dingle_epochs: 200           # base session epochs (DINGLE's --episodes)
+  dingle_ft_epochs: 200        # streaming session epochs (DINGLE's --ft_episodes)
+  dingle_lr: 1.0e-3            # base session LR (DINGLE's --lr)
+  dingle_ft_lr: 1.0e-3         # streaming LR (we expose this; original
+                               # defines --ft_lr=1e-4 but never uses it)
+  dingle_weight_decay: 5.0e-4
+
+  # --- Loss weights ---
+  # Original DINGLE adds dis_loss directly with weight 1.0; the --loss_ratio
+  # CLI arg exists but is unused in main.py. We expose two weights so users
+  # can attenuate the GAN+reconstruction term and the reverse-KD term.
+  dingle_dis_loss_weight: 1.0
+  dingle_kd_loss_weight: 1.0
+
+  # --- Buffer (closest-to-class-mean GCN embeddings) ---
+  dingle_buffer_per_class: 30  # original hard-codes 30 in get_closest_nodes;
+                               # we cap by len(node_ids) to handle small classes
+
+  # --- Class-IL adaptation flags ---
+  # Both default to False (continuous backbone & classifier across sessions)
+  # for sane class-IL behaviour. Set true to replicate original FSCIL flow.
+  dingle_fresh_gcn_per_session: false
+  dingle_fresh_classifier_per_session: false

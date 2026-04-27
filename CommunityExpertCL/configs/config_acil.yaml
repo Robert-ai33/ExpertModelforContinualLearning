@@ -1,0 +1,36 @@
+# ACILCL Configuration
+# Analytic Class-Incremental Learning over graphs with parameter-free GCN.
+# Classifier = RandomBuffer (fixed) + RecursiveLinear (updated via
+# Sherman--Morrison--Woodbury in float64). No SGD, no replay, no forgetting.
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- Parameter-free GCN ---
+  gcn_layers: 2                  # number of message-passing hops
+
+  # --- RandomBuffer (fixed random feature expansion) ---
+  acil_buffer_size: 1024         # P in the paper; typical range 1024-8192
+  acil_buffer_activation: relu   # relu | none
+  acil_buffer_seed: 1998         # fixed across trials; change only for ablation
+
+  # --- RecursiveLinear (analytic head) ---
+  acil_gamma: 1.0e-3             # ridge regularisation; R0 = I / gamma
+  acil_use_bias: true
+
+  # --- RLS batch size ---
+  # The inverse cost inside each fit call is O(b^3). On small datasets set
+  # this equal to the full session train set for a single-shot fit; on
+  # large datasets (e.g. ogbn-arxiv) keep it moderate.
+  acil_rls_batch_size: 1024
+
+  # --- Training / loading ---
+  batch_size: 256                # only used by TaskLoader for DataLoaders
+
+  # --- Debug ---
+  debug: true

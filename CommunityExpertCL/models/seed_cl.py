@@ -21,7 +21,8 @@ Algorithmic mapping from original SEED to this graph port:
   torch.flip(images) augmentation      | removed (no direct graph analog)
   freeze BatchNorm2d in finetune       | removed (GCN has no BN2d)
   GMM on 64-d ResNet features          | GMM on feat_dim GCN embeddings
-  MSE feature-KD during finetune       | same (MSE on GCN embeddings)
+  MSE feature-KD during finetune       | same (MSE on GCN embeddings,
+                                       |  restricted to train_ids only)
   KL divergence over new-class MVNs    | same (via GMM -> MultivariateNormal)
 
 Expected training / inference flow (per session t):
@@ -50,6 +51,7 @@ from tqdm import tqdm
 
 from .gcn_backbone import GCNBackbone
 from .seed_gmm import GaussianMixture
+from utils import compute_ap_af, print_cl_matrix
 
 
 # ----------------------------------------------------------------------
@@ -205,15 +207,14 @@ class SEEDCL:
             [g2l[labels[n].item()] for n in train_ids_list],
             dtype=torch.long, device=self.device)
 
-        optimizer = torch.optim.SGD(
+        # Graph-domain adaptation: use Adam + constant lr to match the
+        # optimization protocol of every other GNN CL baseline (EWC, LwF,
+        # TWP, ERGNN, ...).  The original SEED uses SGD+MultiStepLR which
+        # is tuned for ResNet/CIFAR and consistently under-fits small
+        # graph backbones within the same epoch budget.
+        optimizer = torch.optim.Adam(
             expert.parameters(), lr=self.lr,
-            weight_decay=self.wd, momentum=0.9)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=[
-                int(self.nepochs * 0.3),
-                int(self.nepochs * 0.6),
-                int(self.nepochs * 0.8),
-            ], gamma=0.1)
+            weight_decay=self.wd)
 
         pbar = tqdm(range(self.nepochs), desc=f"S{session_id} SEED-train")
         for _epoch in pbar:
@@ -226,7 +227,6 @@ class SEEDCL:
                 torch.nn.utils.clip_grad_norm_(
                     expert.parameters(), self.clipgrad)
             optimizer.step()
-            scheduler.step()
             pbar.set_postfix(loss=f'{loss.item():.4f}')
 
     # ------------------------------------------------------------------
@@ -261,15 +261,11 @@ class SEEDCL:
             [g2l[labels[n].item()] for n in train_ids_list],
             dtype=torch.long, device=self.device)
 
-        optimizer = torch.optim.SGD(
+        # Graph-domain adaptation: Adam + constant lr (see _train_expert).
+        # ftwd defaults to 0.0, matching the original SEED finetune recipe.
+        optimizer = torch.optim.Adam(
             expert.parameters(), lr=self.lr,
-            weight_decay=self.ftwd, momentum=0.9)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=[
-                int(self.ftepochs * 0.3),
-                int(self.ftepochs * 0.6),
-                int(self.ftepochs * 0.8),
-            ], gamma=0.1)
+            weight_decay=self.ftwd)
 
         pbar = tqdm(range(self.ftepochs),
                     desc=f"S{session_id} SEED-ft(E{bb_to_ft})")
@@ -282,7 +278,12 @@ class SEEDCL:
             logits, feat = expert(x, edge_index, return_features=True)
 
             ce_loss = F.cross_entropy(logits[train_ids], local_labels)
-            kd_loss = F.mse_loss(feat, old_feat)
+            # KD scope aligned with original SEED: restrict MSE to the
+            # current task's training nodes (the "batch" in the image port)
+            # rather than every node in the subgraph.  Using all nodes was
+            # a strictly stronger distillation constraint that damped
+            # plasticity on the new classes.
+            kd_loss = F.mse_loss(feat[train_ids], old_feat[train_ids])
             loss = (1.0 - self.alpha) * ce_loss + self.alpha * kd_loss
 
             loss.backward()
@@ -290,7 +291,6 @@ class SEEDCL:
                 torch.nn.utils.clip_grad_norm_(
                     expert.parameters(), self.clipgrad)
             optimizer.step()
-            scheduler.step()
             pbar.set_postfix(ce=f'{ce_loss.item():.4f}',
                              kd=f'{kd_loss.item():.4f}')
 
@@ -565,16 +565,16 @@ class SEEDCL:
                   f"x {len(self.experts)} experts")
             self._create_distributions(curr_classes, subgraph, train_idx)
 
-            print(f"\n--- Isolated Tests (Session {session_id}) ---")
+            print(f"\n--- Per-Task Tests (Session {session_id}) ---")
+            eval_subgraph = self.task_loader.subgraph_per_task[session_id]
             acc_row = []
             for tid in range(session_id + 1):
-                iso_subgraph = self.task_loader.subgraph_isolated[tid]
                 test_idx = self.task_loader.test_idx_per_task[tid]
                 task_classes = self.task_loader.class_splits[tid]
                 if not test_idx:
                     acc_row.append(0.0)
                     continue
-                res = self._evaluate(iso_subgraph, test_idx)
+                res = self._evaluate(eval_subgraph, test_idx)
                 acc_row.append(res['acc'])
                 print(f"  Task {tid} (classes {task_classes}): "
                       f"Acc={res['acc']:.4f} "
@@ -593,7 +593,8 @@ class SEEDCL:
         print(f"\n{'=' * 60}")
         print("[SEED] FINAL RESULTS")
         print(f"{'=' * 60}")
-        self._print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        ap_history, af, final_ap = compute_ap_af(acc_matrix)
         print(f"\nJoint Accuracy (micro): " + ", ".join(
             [f"S{i}={joint_acc_history[i]:.4f}"
              for i in range(num_sessions)]))
@@ -605,24 +606,7 @@ class SEEDCL:
             'acc_matrix': acc_matrix,
             'joint_acc': joint_acc_history,
             'joint_macro_acc': joint_macro_history,
+            'ap_history': ap_history,
+            'af': af,
+            'final_ap': final_ap,
         }
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _print_cl_matrix(title, matrix, num_sessions):
-        print(f"\n{title}:")
-        header = "Session | " + " | ".join(
-            [f"Task {i:5d}" for i in range(num_sessions)])
-        print(header)
-        print("-" * len(header))
-        for sid, row in enumerate(matrix):
-            parts = []
-            for tid in range(num_sessions):
-                if tid < len(row):
-                    parts.append(f"{row[tid]:.4f} ")
-                else:
-                    parts.append("       ")
-            print(f"   {sid}    | " + " | ".join(parts))

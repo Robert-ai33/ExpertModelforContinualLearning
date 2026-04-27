@@ -1,0 +1,23 @@
+default:
+  # Model (same architecture as ClassificationExpert for fair comparison)
+  hidden_dim: 128
+  dropout: 0.5
+
+  # Training
+  # Total epochs per session (same budget as DirectedExpertCL: 500 total)
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0005
+  batch_size: 256
+
+  # Validation
+  valid_epoch: 10
+  patience: 9999
+
+  # Knowledge Distillation
+  kd_lambda: 1       # weight for KL divergence loss
+  kd_temperature: 1.0  # softmax temperature for distillation
+
+  # Other
+  seed: [42, 123, 456]
+  debug: false

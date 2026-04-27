@@ -1,0 +1,42 @@
+# TEM (Topology-aware Embedding Memory) Configuration
+# Port of PDGNNs-main (KDD 2024) to PyG. Backbone = CustomDecoupledAPPNP
+# (neighbor_agg = parameter-free APPNP, feat_trans = MLP).
+#
+# Defaults below mirror ``PDGNNs-main/source/train.py`` hyperparameters:
+#     lr=0.005, weight_decay=5e-4, epochs=200,
+#     CustomDecoupledAPPNP_args={h_dims:[256], dropout:0.0, bias:False,
+#                                k:2, alpha:0.05, batch_norm:False},
+#     tem_args={budget:400, sampler:cover_max_select_02},
+#     cls_balance=True, classifier_increase=True.
+
+default:
+  seed: [0, 1, 2, 3, 4]
+
+  # --- Data Splitting ---
+  split_S: 5
+  split_t: 3
+  split_v: 1
+
+  # --- TaskLoader batch size (unused by TEM training, kept for API parity) ---
+  batch_size: 256
+
+  # --- CustomDecoupledAPPNP backbone (paper default) ---
+  tem_hidden_dims: [256]      # h_dims in CustomDecoupledAPPNP_args
+  tem_dropout: 0.0            # dropout
+  tem_linear_bias: false      # bias (applied to all MLP linears)
+  tem_k: 2                    # APPNP propagation steps
+  tem_alpha: 0.05             # APPNP teleport probability
+
+  # --- Training ---
+  tem_epochs: 200
+  tem_lr: 0.005
+  tem_weight_decay: 5.0e-4
+  tem_cls_balance: true       # class-balanced CE weights
+
+  # --- TEM memory ---
+  tem_budget: 100             # nodes per class, per task
+  tem_sampler: cover_max_select_02
+  # tem_sampler options:
+  #   random_select         : uniform random per class
+  #   cover_max_select_01   : K-hop coverage count (O(N^2) mem; small graphs only)
+  #   cover_max_select_02   : in-degree proxy (paper default)

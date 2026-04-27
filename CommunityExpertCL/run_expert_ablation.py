@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data import GraphDataset, TaskLoader
 from models import LiteExpertCL
-from utils import seed_everything
+from utils import seed_everything, compute_ap_af
 from main import EXP_SETTINGS
 
 ABLATION_MARKERS = ['o', 's', '^', 'v', 'D', 'P', '*', 'X', 'p', 'h', '<', '>', 'd', 'H', '8']
@@ -57,10 +57,22 @@ def run_with_experts(n_experts, task_loader, config, device, ntrials, seeds):
         avg_row = [np.mean([r['acc_matrix'][s][t] for r in all_results]) for t in range(row_len)]
         avg_matrix.append(avg_row)
 
+    # AP / AF (CGLB convention) on the trial-averaged matrix.
+    ap_history, af, final_ap = compute_ap_af(avg_matrix)
+    per_trial_final_ap = [compute_ap_af(r['acc_matrix'])[2] for r in all_results]
+    per_trial_af = [compute_ap_af(r['acc_matrix'])[1] for r in all_results]
+    final_ap_std = float(np.std(per_trial_final_ap)) if len(per_trial_final_ap) > 1 else 0.0
+    af_std = float(np.std(per_trial_af)) if len(per_trial_af) > 1 else 0.0
+
     return {
         'joint_acc': avg_joint_acc,
         'joint_macro_acc': avg_joint_macro,
         'acc_matrix': avg_matrix,
+        'ap_history': ap_history,
+        'af': af,
+        'final_ap': final_ap,
+        'final_ap_std': final_ap_std,
+        'af_std': af_std,
     }
 
 
@@ -183,7 +195,6 @@ def main():
     parser.add_argument('--ntrials', type=int, default=1)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--svd_dim', type=int, default=0)
-    parser.add_argument('--amp', action='store_true')
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -197,7 +208,6 @@ def main():
     config['split_S'] = exp.get('split_S', config.get('split_S', 5))
     config['split_t'] = exp.get('split_t', config.get('split_t', 3))
     config['split_v'] = exp.get('split_v', config.get('split_v', 1))
-    config['use_amp'] = args.amp
 
     seeds = config.get('seed', [0, 1, 2, 3, 4])
     ntrials = min(args.ntrials, len(seeds))
@@ -232,7 +242,9 @@ def main():
 
         print(f"\n  [max_experts={n_exp}] "
               f"Final Joint Acc (micro): {result['joint_acc'][-1]:.4f}, "
-              f"(macro): {result['joint_macro_acc'][-1]:.4f}")
+              f"(macro): {result['joint_macro_acc'][-1]:.4f}, "
+              f"AP: {result['final_ap']:.4f}, "
+              f"AF: {result['af']:+.4f}")
 
     # Save raw results
     serializable = {}
@@ -241,6 +253,11 @@ def main():
             'joint_acc': [float(v) for v in d['joint_acc']],
             'joint_macro_acc': [float(v) for v in d['joint_macro_acc']],
             'acc_matrix': [[float(v) for v in row] for row in d['acc_matrix']],
+            'ap_history': [float(v) for v in d.get('ap_history', [])],
+            'af': float(d.get('af', 0.0)),
+            'final_ap': float(d.get('final_ap', 0.0)),
+            'final_ap_std': float(d.get('final_ap_std', 0.0)),
+            'af_std': float(d.get('af_std', 0.0)),
         }
     with open(os.path.join(out_dir, 'expert_ablation.json'), 'w') as f:
         json.dump(serializable, f, indent=2)
@@ -252,16 +269,50 @@ def main():
     plot_heatmaps(all_data, expert_counts, num_sessions, args.dataset, out_dir)
     plot_ablation_legend(expert_counts, out_dir)
 
-    # Print comparison table
-    print(f"\n{'='*60}")
+    # Print comparison table (including CGLB AP / AF)
+    show_std = ntrials > 1
+    if show_std:
+        col_widths = (10, 14, 14, 18, 18)
+        header = (f"{'Experts':<{col_widths[0]}} "
+                  f"{'Joint Micro':>{col_widths[1]}} "
+                  f"{'Joint Macro':>{col_widths[2]}} "
+                  f"{'AP (mean +/- std)':>{col_widths[3]}} "
+                  f"{'AF (mean +/- std)':>{col_widths[4]}}")
+    else:
+        col_widths = (10, 14, 14, 12, 12)
+        header = (f"{'Experts':<{col_widths[0]}} "
+                  f"{'Joint Micro':>{col_widths[1]}} "
+                  f"{'Joint Macro':>{col_widths[2]}} "
+                  f"{'AP':>{col_widths[3]}} "
+                  f"{'AF':>{col_widths[4]}}")
+    width = sum(col_widths) + len(col_widths)
+
+    print(f"\n{'=' * max(60, width)}")
     print(f"EXPERT ABLATION RESULTS ({args.dataset}, {ntrials} trial(s))")
-    print(f"{'='*60}")
-    print(f"{'Experts':<10} {'Final Micro':>12} {'Final Macro':>12}")
-    print(f"{'-'*34}")
+    print("CL Matrix: CGLB protocol (cell (k,t) = subgraph_per_task[k] eval on test_idx[t])")
+    print(f"{'=' * max(60, width)}")
+    print(header)
+    print('-' * len(header))
     for n_exp in expert_counts:
-        micro = all_data[n_exp]['joint_acc'][-1]
-        macro = all_data[n_exp]['joint_macro_acc'][-1]
-        print(f"{n_exp:<10} {micro:>12.4f} {macro:>12.4f}")
+        d = all_data[n_exp]
+        micro = d['joint_acc'][-1]
+        macro = d['joint_macro_acc'][-1]
+        ap = d.get('final_ap', 0.0)
+        af = d.get('af', 0.0)
+        if show_std:
+            ap_str = f"{ap:.4f} +/- {d.get('final_ap_std', 0.0):.4f}"
+            af_str = f"{af:+.4f} +/- {d.get('af_std', 0.0):.4f}"
+            print(f"{n_exp:<{col_widths[0]}} "
+                  f"{micro:>{col_widths[1]}.4f} "
+                  f"{macro:>{col_widths[2]}.4f} "
+                  f"{ap_str:>{col_widths[3]}} "
+                  f"{af_str:>{col_widths[4]}}")
+        else:
+            print(f"{n_exp:<{col_widths[0]}} "
+                  f"{micro:>{col_widths[1]}.4f} "
+                  f"{macro:>{col_widths[2]}.4f} "
+                  f"{ap:>{col_widths[3]}.4f} "
+                  f"{af:>+{col_widths[4]}.4f}")
 
 
 if __name__ == '__main__':

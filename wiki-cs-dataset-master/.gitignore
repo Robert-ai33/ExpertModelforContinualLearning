@@ -1,0 +1,8 @@
+./env
+
+# large input/intermediate data files
+data_processing/pipeline_data/
+
+# python scripts
+experiments/tmp
+__pycache__/

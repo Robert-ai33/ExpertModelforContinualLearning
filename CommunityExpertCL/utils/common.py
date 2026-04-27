@@ -19,6 +19,73 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def compute_ap_af(acc_matrix):
+    """Compute per-session AP and final AF following the CGLB convention.
+
+    Args:
+        acc_matrix: list of lists (or 2-D iterable). ``acc_matrix[k]`` has
+            length ``k+1`` and stores the per-task accuracies (in [0, 1])
+            obtained after training session ``k``.
+
+    Returns:
+        ap_per_session (list[float]): AP_k = mean(acc_matrix[k][0..k]).
+        af (float): mean over t in [0, n-2] of
+            ``acc_matrix[n-1][t] - acc_matrix[t][t]``. Negative means
+            forgetting, positive means backward transfer.
+        final_ap (float): ``ap_per_session[-1]`` (or 0.0 if empty).
+
+    Definitions match
+    ``CGLB-master/NCGL/visualize.py::AF`` and the inline AP/AF calculation in
+    ``CGLB-master/NCGL/pipeline.py``.
+    """
+    if not acc_matrix:
+        return [], 0.0, 0.0
+
+    ap_per_session = []
+    for row in acc_matrix:
+        if len(row) > 0:
+            ap_per_session.append(float(np.mean(row)))
+        else:
+            ap_per_session.append(0.0)
+
+    n = len(acc_matrix)
+    last_row = acc_matrix[-1]
+    backward = []
+    for t in range(n - 1):
+        if t < len(last_row) and t < len(acc_matrix[t]):
+            backward.append(float(last_row[t] - acc_matrix[t][t]))
+    af = float(np.mean(backward)) if backward else 0.0
+
+    return ap_per_session, af, ap_per_session[-1]
+
+
+def print_cl_matrix(title, matrix, num_sessions):
+    """Pretty-print a CL accuracy matrix together with AP per row and AF.
+
+    The matrix cells, AP column and AF line are all printed as fractions in
+    [0, 1] (callers can multiply by 100 if they want percentages).
+    """
+    ap_history, af, _ = compute_ap_af(matrix)
+
+    print(f"\n{title}:")
+    header = ("Session | " + " | ".join(
+        [f"Task {i:5d}" for i in range(num_sessions)]) + " |   AP    ")
+    print(header)
+    print("-" * len(header))
+    for sid, row in enumerate(matrix):
+        parts = []
+        for tid in range(num_sessions):
+            if tid < len(row):
+                parts.append(f"{row[tid]:.4f} ")
+            else:
+                parts.append("       ")
+        ap_val = ap_history[sid] if sid < len(ap_history) else 0.0
+        print(f"   {sid}    | " + " | ".join(parts) + f" | {ap_val:.4f} ")
+    print("-" * len(header))
+    final_ap = ap_history[-1] if ap_history else 0.0
+    print(f"Final AP: {final_ap:.4f}    AF: {af:+.4f}")
+
+
 def save_checkpoint(model, optimizer, epoch, path, dataset, model_name, seed):
     """Save model checkpoint."""
     os.makedirs(path, exist_ok=True)

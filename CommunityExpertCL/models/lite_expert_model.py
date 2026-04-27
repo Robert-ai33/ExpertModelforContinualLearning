@@ -12,11 +12,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 
 from torch_geometric.utils import degree
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
+
+from utils import compute_ap_af, print_cl_matrix
 
 
 # ======================================================================
@@ -160,6 +161,20 @@ class LiteExpertCL:
         self.mae_gamma = config.get('mae_gamma', 2)
         self.pearson_weight = config.get('pearson_weight', 0.0)
         self.norm_ratio_weight = config.get('norm_ratio_weight', 0.0)
+        # Loss formulation used for (a) training the MAE, (b) validating it,
+        # (c) generating pseudo data during merging, and (d) routing at
+        # inference. Options:
+        #   'joint' -- default, scaled-cosine + pearson_weight*Pearson
+        #              + norm_ratio_weight*norm-ratio (the original three-term
+        #              loss).
+        #   'mse'   -- plain F.mse_loss(recon, target). Pearson/norm-ratio
+        #              weights are ignored in this mode, so it's a true
+        #              ablation of the joint loss.
+        self.mae_loss_type = str(config.get('mae_loss', 'joint')).lower()
+        if self.mae_loss_type not in ('joint', 'mse'):
+            raise ValueError(
+                f"Unknown mae_loss '{self.mae_loss_type}'. "
+                f"Expected 'joint' or 'mse'.")
 
         self.np_hidden_dim = config.get('np_hidden_dim', 256)
         self.np_epochs = config.get('np_epochs', 100)
@@ -170,9 +185,6 @@ class LiteExpertCL:
         self.np_enriched_row_chunk = config.get('np_enriched_row_chunk', 512)
         self.np_enriched_col_chunk = config.get('np_enriched_col_chunk', 512)
         self.neighbor_stats_weight = config.get('neighbor_stats_weight', 1.0)
-
-        self.use_amp = config.get('use_amp', False)
-        self.scaler = GradScaler(enabled=self.use_amp)
 
         # Expert merging hyperparameters
         self.merge_pseudo_samples = config.get('merge_pseudo_samples', 256)
@@ -192,7 +204,7 @@ class LiteExpertCL:
         # Per-expert class mapping (populated lazily in _train_session)
         self.expert_g2l = []   # expert_g2l[eid] = {global_class: local_index}
         self.expert_l2g = []   # expert_l2g[eid] = tensor [local_index -> global_class]
-        self.expert_usage_count = []  # usage count from last Joint Test
+        self.expert_usage_count = []  # usage count over joint TEST nodes (drives merge choice)
         self.expert_stats = []  # {mean, var, n} of training embeddings per expert
         self.expert_neighbor_stats = []  # {mean, var, n} of neighbor-enriched embeddings
 
@@ -267,11 +279,11 @@ class LiteExpertCL:
                 session_id, subgraph, train_idx, valid_idx,
                 curr_classes)
 
-            # Isolated Tests
-            print(f"\n--- Isolated Tests (Session {session_id}) ---")
+            # Per-Task Tests on the cumulative subgraph (CGLB)
+            print(f"\n--- Per-Task Tests (Session {session_id}) ---")
+            eval_subgraph = self.task_loader.subgraph_per_task[session_id]
             acc_row = []
             for tid in range(session_id + 1):
-                iso_subgraph = self.task_loader.subgraph_isolated[tid]
                 test_idx = self.task_loader.test_idx_per_task[tid]
                 task_classes = self.task_loader.class_splits[tid]
 
@@ -280,7 +292,7 @@ class LiteExpertCL:
                     print(f"  Task {tid} (classes {task_classes}): no test nodes")
                     continue
 
-                res = self._evaluate_subgraph(iso_subgraph, test_idx)
+                res = self._evaluate_subgraph(eval_subgraph, test_idx)
                 acc_row.append(res['acc'])
                 print(f"  Task {tid} (classes {task_classes}): "
                       f"Acc={res['acc']:.4f} "
@@ -316,7 +328,8 @@ class LiteExpertCL:
         print("FINAL RESULTS")
         print(f"{'='*60}")
 
-        self._print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        ap_history, af, final_ap = compute_ap_af(acc_matrix)
 
         print(f"\nJoint Accuracy (micro): " + ", ".join(
             [f"S{i}={joint_acc_history[i]:.4f}" for i in range(num_sessions)]))
@@ -327,6 +340,9 @@ class LiteExpertCL:
             'acc_matrix': acc_matrix,
             'joint_acc': joint_acc_history,
             'joint_macro_acc': joint_macro_history,
+            'ap_history': ap_history,
+            'af': af,
+            'final_ap': final_ap,
         }
 
     def _train_session(self, session_id, subgraph, train_idx, valid_idx,
@@ -390,32 +406,18 @@ class LiteExpertCL:
             expert.mae_decoder.train()
 
             mask_matrix = self._sample_shared_mask(curr_train_indices.size(0))
-            with autocast(enabled=self.use_amp):
-                h_target = h[curr_train_indices]
-                masked_h = h_target.clone()
-                mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
-                masked_h[mask_matrix] = mask_vals[mask_matrix]
+            h_target = h[curr_train_indices]
+            masked_h = h_target.clone()
+            mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
+            masked_h[mask_matrix] = mask_vals[mask_matrix]
 
-                recon = expert.mae_decoder(masked_h)
+            recon = expert.mae_decoder(masked_h)
 
-                recon_loss = scaled_cosine_error(
-                    recon, h_target, gamma=self.mae_gamma)
-
-                pearson_loss_val = torch.tensor(0.0, device=self.device)
-                if self.pearson_weight > 0:
-                    pearson_loss_val = pearson_correlation_loss(h_target, recon)
-
-                norm_ratio_loss_val = torch.tensor(0.0, device=self.device)
-                if self.norm_ratio_weight > 0:
-                    norm_ratio_loss_val = norm_ratio_loss(h_target, recon)
-
-                loss = (recon_loss + self.pearson_weight * pearson_loss_val
-                       + self.norm_ratio_weight * norm_ratio_loss_val)
+            loss = self._mae_loss(recon, h_target)
 
             optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
+            loss.backward()
+            optimizer.step()
 
             if epoch > 0 and epoch % valid_ep == 0:
                 val_loss = self._validate_mae(
@@ -433,15 +435,13 @@ class LiteExpertCL:
                     if patience_cnt > patience:
                         break
                 pbar.set_postfix(
-                    recon=f'{recon_loss.item():.4f}',
-                    pearson=f'{pearson_loss_val.item():.4f}',
-                    norm=f'{norm_ratio_loss_val.item():.4f}',
+                    loss=f'{loss.item():.4f}',
+                    type=self.mae_loss_type,
                     val=f'{val_loss:.4f}')
             else:
                 pbar.set_postfix(
-                    recon=f'{recon_loss.item():.4f}',
-                    pearson=f'{pearson_loss_val.item():.4f}',
-                    norm=f'{norm_ratio_loss_val.item():.4f}')
+                    loss=f'{loss.item():.4f}',
+                    type=self.mae_loss_type)
 
         if best_mae_state is not None:
             expert.mae_decoder.load_state_dict(
@@ -479,12 +479,10 @@ class LiteExpertCL:
         for epoch in pbar:
             self.model.train()
             optimizer.zero_grad()
-            with autocast(enabled=self.use_amp):
-                logits = expert.classifier(h[train_indices])
-                loss = F.cross_entropy(logits, local_train_labels)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
+            logits = expert.classifier(h[train_indices])
+            loss = F.cross_entropy(logits, local_train_labels)
+            loss.backward()
+            optimizer.step()
 
             if epoch > 0 and epoch % valid_ep == 0:
                 val_loss = self._validate_cls(
@@ -511,14 +509,14 @@ class LiteExpertCL:
     def _train_neighbor_predictor(self, session_id, expert, h, subgraph,
                                   train_idx, train_mask, valid_idx,
                                   valid_ep, patience):
-        """Phase 2: Train neighbor predictor on edges with at least one training node."""
+        """Phase 2: Train neighbor predictor on edges with BOTH endpoints in training set."""
         self._freeze_all()
         for param in expert.neighbor_predictor.parameters():
             param.requires_grad = True
 
         edge_index = subgraph['edge_index_no_selfloop'].to(self.device)
         src, dst = edge_index[0], edge_index[1]
-        has_train = train_mask[src] | train_mask[dst]
+        has_train = train_mask[src] & train_mask[dst]
         filt_src = src[has_train]
         filt_dst = dst[has_train]
         keep = filt_src < filt_dst
@@ -536,7 +534,6 @@ class LiteExpertCL:
         edge_pairs = torch.unique(edge_pairs, dim=0)
         all_edge_set = set(map(tuple, edge_pairs.tolist()))
 
-        all_nodes_list = subgraph['all_nodes']
         train_idx_list = list(train_idx)
 
         optimizer = optim.Adam(expert.neighbor_predictor.parameters(),
@@ -551,7 +548,7 @@ class LiteExpertCL:
 
             num_neg = self.np_neg_ratio * num_pos
             neg_src, neg_dst = self._sample_negative_edges(
-                all_edge_set, train_idx_list, all_nodes_list, num_neg)
+                all_edge_set, train_idx_list, num_neg)
 
             all_src = torch.cat([pos_src, neg_src])
             all_dst = torch.cat([pos_dst, neg_dst])
@@ -565,15 +562,13 @@ class LiteExpertCL:
             all_dst = all_dst[perm]
             all_labels = all_labels[perm]
 
-            with autocast(enabled=self.use_amp):
-                edge_emb = self._compute_edge_embedding(h, all_src, all_dst)
-                logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
-                loss = F.binary_cross_entropy_with_logits(logits, all_labels)
+            edge_emb = self._compute_edge_embedding(h, all_src, all_dst)
+            logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(logits, all_labels)
 
             optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(optimizer)
-            self.scaler.update()
+            loss.backward()
+            optimizer.step()
 
             if epoch > 0 and epoch % valid_ep == 0:
                 val_loss = self._validate_np(expert, h, subgraph, valid_idx)
@@ -596,27 +591,25 @@ class LiteExpertCL:
 
         print(f"  NP: Trained on {num_pos} positive edges")
 
-    def _sample_negative_edges(self, all_edge_set, train_idx_list,
-                               all_nodes_list, num_neg):
-        """Sample negative edges: at least one in train_idx, no real edge, (a,b)=(b,a)."""
+    def _sample_negative_edges(self, all_edge_set, train_idx_list, num_neg):
+        """Sample negative edges: BOTH endpoints in train_idx, no real edge, (a,b)=(b,a)."""
         device = self.device
         neg_set = set()
         neg_src_list = []
         neg_dst_list = []
 
         n_train = len(train_idx_list)
-        n_all = len(all_nodes_list)
 
         for _ in range(50):
             if len(neg_src_list) >= num_neg:
                 break
             remain = (num_neg - len(neg_src_list)) * 3
             a_idx = torch.randint(n_train, (remain,))
-            b_idx = torch.randint(n_all, (remain,))
+            b_idx = torch.randint(n_train, (remain,))
 
             for i in range(remain):
                 ai = train_idx_list[a_idx[i].item()]
-                bi = all_nodes_list[b_idx[i].item()]
+                bi = train_idx_list[b_idx[i].item()]
                 if ai == bi:
                     continue
                 edge = (min(ai, bi), max(ai, bi))
@@ -723,7 +716,7 @@ class LiteExpertCL:
 
     @torch.no_grad()
     def _validate_np(self, expert, h, subgraph, valid_idx):
-        """Validate NP on edges involving validation nodes."""
+        """Validate NP on edges with BOTH endpoints in validation set."""
         expert.neighbor_predictor.eval()
         edge_index = subgraph['edge_index_no_selfloop'].to(self.device)
         src, dst = edge_index[0], edge_index[1]
@@ -732,7 +725,7 @@ class LiteExpertCL:
         for idx in valid_idx:
             valid_mask[idx] = True
 
-        has_valid = valid_mask[src] | valid_mask[dst]
+        has_valid = valid_mask[src] & valid_mask[dst]
         filt_src = src[has_valid]
         filt_dst = dst[has_valid]
         keep = filt_src < filt_dst
@@ -742,11 +735,10 @@ class LiteExpertCL:
         if pos_src.size(0) == 0:
             return float('inf')
 
-        with autocast(enabled=self.use_amp):
-            edge_emb = self._compute_edge_embedding(h, pos_src, pos_dst)
-            logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
-            labels = torch.ones_like(logits)
-            val_loss = F.binary_cross_entropy_with_logits(logits, labels)
+        edge_emb = self._compute_edge_embedding(h, pos_src, pos_dst)
+        logits = expert.neighbor_predictor(edge_emb).squeeze(-1)
+        labels = torch.ones_like(logits)
+        val_loss = F.binary_cross_entropy_with_logits(logits, labels)
 
         return val_loss.item()
 
@@ -968,11 +960,7 @@ class LiteExpertCL:
             masked_h = torch.where(mask_matrix, mask_vals, h_fake)
 
             recon = expert.mae_decoder(masked_h)
-            loss_mae = scaled_cosine_error(recon, h_fake, gamma=self.mae_gamma)
-            if self.pearson_weight > 0:
-                loss_mae = loss_mae + self.pearson_weight * pearson_correlation_loss(h_fake, recon)
-            if self.norm_ratio_weight > 0:
-                loss_mae = loss_mae + self.norm_ratio_weight * norm_ratio_loss(h_fake, recon)
+            loss_mae = self._mae_loss(recon, h_fake)
 
             # Per-sample confidence: minimize entropy so each sample has a clear class
             logits = expert.classifier(h_fake)
@@ -1041,13 +1029,7 @@ class LiteExpertCL:
 
             recon = merged_expert.mae_decoder(masked_h)
 
-            loss = scaled_cosine_error(recon, pseudo_data, gamma=self.mae_gamma)
-            if self.pearson_weight > 0:
-                loss = loss + self.pearson_weight * pearson_correlation_loss(
-                    pseudo_data, recon)
-            if self.norm_ratio_weight > 0:
-                loss = loss + self.norm_ratio_weight * norm_ratio_loss(
-                    pseudo_data, recon)
+            loss = self._mae_loss(recon, pseudo_data)
 
             optimizer.zero_grad()
             loss.backward()
@@ -1148,6 +1130,49 @@ class LiteExpertCL:
 
     # ==================== Validation ====================
 
+    # ==================== MAE loss (joint / mse switch) ====================
+
+    def _mae_loss(self, recon, target):
+        """Scalar MAE loss used by training / validation / pseudo-data gen.
+
+        - ``mae_loss='joint'`` (default) uses the original three-term
+          combination: scaled-cosine-error + pearson_weight * Pearson
+          correlation loss + norm_ratio_weight * norm-ratio loss.
+        - ``mae_loss='mse'`` uses ``F.mse_loss(recon, target)``; pearson and
+          norm-ratio weights are ignored, so it is a clean ablation.
+        """
+        if self.mae_loss_type == 'mse':
+            return F.mse_loss(recon, target)
+
+        loss = scaled_cosine_error(recon, target, gamma=self.mae_gamma)
+        if self.pearson_weight > 0:
+            loss = loss + self.pearson_weight * pearson_correlation_loss(
+                target, recon)
+        if self.norm_ratio_weight > 0:
+            loss = loss + self.norm_ratio_weight * norm_ratio_loss(
+                target, recon)
+        return loss
+
+    def _mae_loss_per_node(self, recon, target):
+        """Per-node MAE loss used by the routing selector.
+
+        Returns a ``(N,)`` tensor matching the batch size so that callers can
+        still ``argmin`` across experts. ``'mse'`` mode uses the row-wise mean
+        squared error, ``'joint'`` mode uses the per-node equivalent of the
+        three-term combination.
+        """
+        if self.mae_loss_type == 'mse':
+            return ((recon - target) ** 2).mean(dim=1)
+
+        loss = scaled_cosine_error_per_node(recon, target, gamma=self.mae_gamma)
+        if self.pearson_weight > 0:
+            loss = loss + self.pearson_weight * pearson_loss_per_node(
+                target, recon)
+        if self.norm_ratio_weight > 0:
+            loss = loss + self.norm_ratio_weight * norm_ratio_loss_per_node(
+                target, recon)
+        return loss
+
     def _sample_shared_mask(self, num_target):
         """Sample one shared mask for all nodes: (num_target, input_dim) bool."""
         num_mask = int(self.mask_ratio * self.input_dim)
@@ -1182,9 +1207,8 @@ class LiteExpertCL:
         local_labels = torch.tensor(
             [g2l[labels[idx].item()] for idx in valid_indices],
             dtype=torch.long, device=self.device)
-        with autocast(enabled=self.use_amp):
-            logits = expert.classifier(h[valid_t])
-            val_loss = F.cross_entropy(logits, local_labels)
+        logits = expert.classifier(h[valid_t])
+        val_loss = F.cross_entropy(logits, local_labels)
         return val_loss.item()
 
     @torch.no_grad()
@@ -1198,21 +1222,14 @@ class LiteExpertCL:
         valid_t = torch.tensor(valid_indices, device=self.device, dtype=torch.long)
         mask_matrix = self._sample_shared_mask(valid_t.size(0))
 
-        with autocast(enabled=self.use_amp):
-            h_val = h[valid_t]
-            masked_h = h_val.clone()
-            mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
-            masked_h[mask_matrix] = mask_vals[mask_matrix]
+        h_val = h[valid_t]
+        masked_h = h_val.clone()
+        mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
+        masked_h[mask_matrix] = mask_vals[mask_matrix]
 
-            recon = expert.mae_decoder(masked_h)
+        recon = expert.mae_decoder(masked_h)
 
-            val_loss = scaled_cosine_error(recon, h_val, gamma=self.mae_gamma)
-
-            if self.pearson_weight > 0:
-                val_loss = val_loss + self.pearson_weight * pearson_correlation_loss(h_val, recon)
-
-            if self.norm_ratio_weight > 0:
-                val_loss = val_loss + self.norm_ratio_weight * norm_ratio_loss(h_val, recon)
+        val_loss = self._mae_loss(recon, h_val)
 
         return val_loss.item()
 
@@ -1250,8 +1267,7 @@ class LiteExpertCL:
             eid_int = eid.item()
             expert = self.model.experts[eid_int]
             l2g = self.expert_l2g[eid_int]
-            with autocast(enabled=self.use_amp):
-                logits = expert.classifier(h[target_t[mask]])
+            logits = expert.classifier(h[target_t[mask]])
             local_preds = logits.argmax(dim=1)
             predictions[mask] = l2g[local_preds]
 
@@ -1268,19 +1284,12 @@ class LiteExpertCL:
 
         for eid in range(num_experts):
             expert = self.model.experts[eid]
-            with autocast(enabled=self.use_amp):
-                masked_h = h_batch.clone()
-                mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
-                masked_h[mask_matrix] = mask_vals[mask_matrix]
-                recon = expert.mae_decoder(masked_h)
+            masked_h = h_batch.clone()
+            mask_vals = expert.mask_token.unsqueeze(0).expand_as(masked_h)
+            masked_h[mask_matrix] = mask_vals[mask_matrix]
+            recon = expert.mae_decoder(masked_h)
 
-                scaled_cos = scaled_cosine_error_per_node(
-                    recon, h_batch, gamma=self.mae_gamma)
-                pearson = pearson_loss_per_node(h_batch, recon)
-                nr = norm_ratio_loss_per_node(h_batch, recon)
-
-            recon_errors[eid] = (scaled_cos + self.pearson_weight * pearson
-                                + self.norm_ratio_weight * nr)
+            recon_errors[eid] = self._mae_loss_per_node(recon, h_batch)
 
         return recon_errors.argmin(dim=0)
 
@@ -1300,9 +1309,11 @@ class LiteExpertCL:
         total = 0
         per_class_correct = {}
         per_class_total = {}
+        test_positions = []
         for gid in test_idx:
             if gid in g2l:
                 lid = g2l[gid]
+                test_positions.append(lid)
                 pred = node_preds[lid].item()
                 true = true_labels[lid].item()
                 per_class_total[true] = per_class_total.get(true, 0) + 1
@@ -1319,26 +1330,17 @@ class LiteExpertCL:
             per_class_acc.append(c_correct / c_total if c_total > 0 else 0.0)
         macro_acc = sum(per_class_acc) / len(per_class_acc) if per_class_acc else 0.0
 
+        # Expert assignments restricted to test nodes -- this is what drives
+        # both the printed expert distribution and the merging usage count.
+        if test_positions:
+            test_expert_assigns = expert_assigns[
+                torch.tensor(test_positions, dtype=torch.long)]
+        else:
+            test_expert_assigns = torch.zeros(0, dtype=torch.long)
+
         return {
             'acc': acc, 'macro_acc': macro_acc,
             'correct': correct, 'total': total,
-            'expert_assignments': expert_assigns,
+            'expert_assignments': test_expert_assigns,
         }
 
-    # ==================== Printing ====================
-
-    @staticmethod
-    def _print_cl_matrix(title, matrix, num_sessions):
-        print(f"\n{title}:")
-        header = "Session | " + " | ".join(
-            [f"Task {i:5d}" for i in range(num_sessions)])
-        print(header)
-        print("-" * len(header))
-        for sid, row in enumerate(matrix):
-            parts = []
-            for tid in range(num_sessions):
-                if tid < len(row):
-                    parts.append(f"{row[tid]:.4f} ")
-                else:
-                    parts.append("       ")
-            print(f"   {sid}    | " + " | ".join(parts))

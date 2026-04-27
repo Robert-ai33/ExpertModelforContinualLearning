@@ -26,6 +26,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from .gcn_backbone import GCNBackbone
+from utils import compute_ap_af, print_cl_matrix
 
 
 # ======================================================================
@@ -129,10 +130,18 @@ def _multi_class_cross_entropy(logits, targets, T=2.0):
 # ======================================================================
 
 class _CaTEncoder(nn.Module):
-    """Random encoder for CaT distribution matching (Linear layers wrapping GCNConv)."""
+    """Random linear encoder for CaT distribution matching.
 
-    def __init__(self, nin, nhid, nout, nlayers):
+    Mirrors `backbones.encoder.Encoder` in the original CaT code: the graph
+    aggregation is performed ONCE (k-hop normalised propagation, independent
+    of layer parameters) and cached as ``feat_agg``; random-reinit iterations
+    only refresh the MLP. ``encode_without_e`` is a pure MLP call, used for
+    the synthetic graph (self-loops only).
+    """
+
+    def __init__(self, nin, nhid, nout, nlayers, activation=True):
         super().__init__()
+        self.activation = activation
         self.layers = nn.ModuleList()
         if nlayers == 1:
             self.layers.append(nn.Linear(nin, nout))
@@ -141,50 +150,72 @@ class _CaTEncoder(nn.Module):
             for _ in range(nlayers - 2):
                 self.layers.append(nn.Linear(nhid, nhid))
             self.layers.append(nn.Linear(nhid, nout))
+        # Cached aggregated real-node features; reset by clear_cache()
+        self._feat_agg = None
 
     def initialize(self):
         for layer in self.layers:
             layer.reset_parameters()
 
-    def encode_with_graph(self, x, edge_index, hop=1):
-        """Encode with k-hop neighbor aggregation then MLP layers."""
+    def clear_cache(self):
+        self._feat_agg = None
+
+    @staticmethod
+    def _gcn_norm_adj(edge_index, num_nodes, dtype, device):
         from torch_geometric.utils import add_self_loops, degree
-        num_nodes = x.size(0)
         edge_index_sl, _ = add_self_loops(edge_index, num_nodes=num_nodes)
         row, col = edge_index_sl
-        deg = degree(col, num_nodes, dtype=x.dtype)
+        deg = degree(col, num_nodes, dtype=dtype)
         deg_inv_sqrt = deg.pow(-0.5)
         deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
         norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-
-        adj = torch.sparse_coo_tensor(
-            torch.stack([col, row]), norm, (num_nodes, num_nodes)
+        return torch.sparse_coo_tensor(
+            torch.stack([col, row]), norm, (num_nodes, num_nodes),
+            device=device,
         ).coalesce()
 
-        h = x
-        for _ in range(hop):
-            h = torch.sparse.mm(adj, h)
+    def encode_with_graph(self, x, edge_index, hop=1):
+        """k-hop propagate real features, then run the linear stack.
 
+        Aggregation is cached in ``self._feat_agg`` because it doesn't depend
+        on the randomly re-initialised linear layers (same behaviour as the
+        original CaT Encoder). This both aligns with the paper and saves the
+        per-iteration sparse matmul memory/time.
+        """
+        if self._feat_agg is None:
+            num_nodes = x.size(0)
+            adj = self._gcn_norm_adj(edge_index, num_nodes, x.dtype, x.device)
+            h = x
+            for _ in range(hop):
+                h = torch.sparse.mm(adj, h)
+            self._feat_agg = h
+        h = self._feat_agg
         for layer in self.layers[:-1]:
-            h = F.relu(layer(h))
+            h = layer(h)
+            if self.activation:
+                h = F.relu(h)
         return h
 
     def encode_without_graph(self, x):
-        """Encode without graph structure (pure MLP)."""
+        """Pure MLP forward for synthetic nodes (self-loops only)."""
         h = x
         for layer in self.layers[:-1]:
-            h = F.relu(layer(h))
+            h = layer(h)
+            if self.activation:
+                h = F.relu(h)
         return h
 
 
 def _cat_condense_task(x, edge_index, train_ids, labels, classes, budget,
                        n_encoders=10, feat_lr=0.01, hid_dim=256, emb_dim=128,
-                       n_layers=2, hop=1, device='cpu'):
-    """
-    CaT graph condensation: generate synthetic nodes for one task.
+                       n_layers=2, hop=1, activation=True, device='cpu'):
+    """CaT graph condensation for one task.
 
-    Uses distribution matching with random encoders.
-    Real nodes are encoded with graph structure; synthetic nodes without.
+    Distribution matching with random linear encoders. Real nodes are encoded
+    with k-hop graph aggregation (cached inside the encoder); synthetic nodes
+    are encoded without any graph structure. Memory is saved by (a) running
+    the condensation on a task-local/isolated subgraph (callers pass this in)
+    and (b) caching the aggregated real features once for all encoder redraws.
     """
     num_features = x.size(1)
 
@@ -239,7 +270,8 @@ def _cat_condense_task(x, edge_index, train_ids, labels, classes, budget,
                 mask[nid] = True
         cls_train_masks[c] = mask
 
-    encoder = _CaTEncoder(num_features, hid_dim, emb_dim, n_layers).to(device)
+    encoder = _CaTEncoder(num_features, hid_dim, emb_dim, n_layers,
+                          activation=activation).to(device)
 
     for _ in range(n_encoders):
         encoder.initialize()
@@ -265,6 +297,9 @@ def _cat_condense_task(x, edge_index, train_ids, labels, classes, budget,
         loss.backward()
         opt_feat.step()
 
+    # Drop the cached aggregation so the next call doesn't leak large tensors.
+    encoder.clear_cache()
+    del encoder, x_dev, edge_dev, cls_train_masks
     return feat_cond.detach(), labels_cond
 
 
@@ -273,15 +308,53 @@ def _cat_condense_task(x, edge_index, train_ids, labels, classes, budget,
 # ======================================================================
 
 class _DeLoMeSGC(nn.Module):
-    """Lightweight SGC used inside DeLoMe condensation (k-hop aggregation + linear)."""
+    """SGC probe used inside DeLoMe condensation.
 
-    def __init__(self, input_dim, hidden_dim, output_dim, k=2):
+    Faithful to ``Backbones.gnns.SGC`` in the original DeLoMe code:
+    - k-hop symmetric-normalised neighbour aggregation (parameter-free).
+    - A stack of linear layers (``h_dims`` hidden dims; empty means a single
+      linear). LeakyReLU(0.2) between layers, matching the original.
+    - Optional BatchNorm1d / Dropout between layers (off by default, also
+      matching the default configs).
+    - Output size = ``num_all_classes`` (unsliced), the slicing to the
+      ``[offset1:offset2]`` range happens in the caller.
+    """
+
+    def __init__(self, input_dim, num_all_classes, k=2, h_dims=(256,),
+                 batch_norm=False, dropout=0.0, linear_bias=True):
         super().__init__()
         self.k = k
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.batch_norm = batch_norm
+        self.dropout = dropout
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.feat_trans = nn.ModuleList()
+        self.bns = nn.ModuleList() if batch_norm else None
 
-    def _sgc_agg(self, x, edge_index, num_nodes):
+        h_dims = list(h_dims) if h_dims is not None else []
+        if len(h_dims) > 0:
+            self.feat_trans.append(nn.Linear(input_dim, h_dims[0], bias=linear_bias))
+            if batch_norm:
+                self.bns.append(nn.BatchNorm1d(h_dims[0]))
+            for i in range(len(h_dims) - 1):
+                self.feat_trans.append(
+                    nn.Linear(h_dims[i], h_dims[i + 1], bias=linear_bias))
+                if batch_norm:
+                    self.bns.append(nn.BatchNorm1d(h_dims[i + 1]))
+            self.feat_trans.append(
+                nn.Linear(h_dims[-1], num_all_classes, bias=linear_bias))
+        else:
+            self.feat_trans.append(
+                nn.Linear(input_dim, num_all_classes, bias=linear_bias))
+
+    @staticmethod
+    def sgc_aggregate(x, edge_index, num_nodes, k):
+        """k-hop symmetric normalised aggregation (parameter-free).
+
+        Equivalent to ``Backbones.gnns.SGC_Agg`` in the original DeLoMe. It's
+        a ``staticmethod`` because it doesn't depend on the layer weights --
+        callers that re-draw the SGC every epoch can precompute the result
+        once on the real graph and pass it in via ``pre_agg``.
+        """
         from torch_geometric.utils import add_self_loops, degree
         edge_index_sl, _ = add_self_loops(edge_index, num_nodes=num_nodes)
         row, col = edge_index_sl
@@ -291,35 +364,75 @@ class _DeLoMeSGC(nn.Module):
         norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
 
         adj = torch.sparse_coo_tensor(
-            torch.stack([col, row]), norm, (num_nodes, num_nodes)
+            torch.stack([col, row]), norm, (num_nodes, num_nodes),
+            device=x.device,
         ).coalesce()
 
-        for _ in range(self.k):
+        for _ in range(k):
             x = torch.sparse.mm(adj, x)
         return x
 
-    def forward(self, x, edge_index, num_nodes=None):
-        if num_nodes is None:
-            num_nodes = x.size(0)
-        h = self._sgc_agg(x, edge_index, num_nodes)
-        h = F.relu(self.fc1(h))
-        return self.fc2(h)
+    def forward(self, x, edge_index, num_nodes=None, pre_agg=None):
+        """Forward. If ``pre_agg`` is given we skip the k-hop aggregation
+        (used when the same real graph is re-read many times per condensation
+        epoch -- the aggregation doesn't depend on the linear layers)."""
+        if pre_agg is not None:
+            h = pre_agg
+        else:
+            if num_nodes is None:
+                num_nodes = x.size(0)
+            h = self.sgc_aggregate(x, edge_index, num_nodes, self.k)
+
+        for i, layer in enumerate(self.feat_trans):
+            h = layer(h)
+            if i < len(self.feat_trans) - 1:
+                if self.batch_norm:
+                    h = self.bns[i](h)
+                h = self.leaky_relu(h)
+                if self.dropout > 0:
+                    h = F.dropout(h, p=self.dropout, training=self.training)
+        return h
 
     def reset_params(self):
-        self.fc1.reset_parameters()
-        self.fc2.reset_parameters()
+        for layer in self.feat_trans:
+            layer.reset_parameters()
+        if self.batch_norm and self.bns is not None:
+            for bn in self.bns:
+                bn.reset_parameters()
 
 
-def _delome_condense_task(x, edge_index, train_ids, labels, classes, budget,
-                          num_all_classes, hidden_dim=256, sgc_k=2,
-                          condense_epochs=600, feat_lr=1e-4, device='cpu'):
-    """
-    DeLoMe graph condensation via gradient matching.
+def _delome_condense_task(x, edge_index, train_ids, labels, classes,
+                          seen_classes, budget, num_all_classes,
+                          h_dims=(256,), sgc_k=2, sgc_bn=False,
+                          sgc_dropout=0.0, sgc_linear_bias=True,
+                          condense_epochs=900, feat_lr=1e-4, seed=42,
+                          device='cpu'):
+    """DeLoMe graph condensation via gradient matching (faithful port).
 
-    For each class in *classes*, learn up to *budget* synthetic node features
-    so that the gradient on synthetic data matches the gradient on real data.
+    Follows ``Baselines/gcond.py::GCond.train`` from the original DeLoMe repo:
+
+    - Budget per class = min(budget, |class-train-set|), fall back to 1 if
+      the class is completely absent so that the class index stays valid.
+    - Synthetic features are initialised by randomly sampling real training
+      features of each class (``get_sub_adj_feat``).
+    - Outer loop ``epochs`` (default 900 to match the hard-coded original):
+      draw a fresh SGC, reset its parameters, then for each class in the
+      current task take one gradient-matching step on ``feat_syn``.
+    - Both the real and the synthetic CE losses are restricted to the
+      seen-classes slice ``output[:, seen_classes]`` with labels remapped
+      into that slice (equivalent to ``[offset1:offset2]`` + ``labels-offset1``
+      in the original; this is the definitional ``classifier_increase`` slicing
+      that the gradient-matching algorithm relies on).
+    - Memory is saved by caching the k-hop aggregation of the real features
+      (parameter-free and constant across epochs) via ``pre_agg`` and by
+      running on an isolated per-task subgraph (supplied by the caller).
     """
     num_features = x.size(1)
+
+    rng = random.Random(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     cls_train = {}
     for c in classes:
@@ -344,7 +457,7 @@ def _delome_condense_task(x, edge_index, train_ids, labels, classes, budget,
         ids = cls_train.get(c, [])
         n = n_syn_per_cls[c]
         if ids:
-            sampled = [ids[random.randint(0, len(ids) - 1)] for _ in range(n)]
+            sampled = [ids[rng.randint(0, len(ids) - 1)] for _ in range(n)]
             idx_init.extend(sampled)
         else:
             idx_init.extend([0] * n)
@@ -357,8 +470,26 @@ def _delome_condense_task(x, edge_index, train_ids, labels, classes, budget,
 
     self_loop_edge = torch.arange(n_syn, device=device).unsqueeze(0).repeat(2, 1)
 
+    # Seen-classes slice (emulates [offset1:offset2] for class-IL with
+    # classifier_increase=True). Labels are remapped into [0, |seen|).
+    seen_cls_tensor = torch.tensor(sorted(seen_classes), dtype=torch.long,
+                                   device=device)
+    label_to_col = torch.full((num_all_classes,), -1, dtype=torch.long,
+                              device=device)
+    for i, c in enumerate(sorted(seen_classes)):
+        label_to_col[c] = i
+
+    # Cache the k-hop aggregation of the real features once; it does not
+    # depend on the linear-layer weights that get reset every epoch.
+    with torch.no_grad():
+        real_pre_agg = _DeLoMeSGC.sgc_aggregate(
+            x_dev, edge_dev, num_nodes=x_dev.size(0), k=sgc_k).detach()
+
     for epoch in range(condense_epochs):
-        sgc = _DeLoMeSGC(num_features, hidden_dim, num_all_classes, k=sgc_k).to(device)
+        sgc = _DeLoMeSGC(num_features, num_all_classes, k=sgc_k,
+                         h_dims=h_dims, batch_norm=sgc_bn,
+                         dropout=sgc_dropout,
+                         linear_bias=sgc_linear_bias).to(device)
         sgc.reset_params()
         sgc_params = list(sgc.parameters())
         sgc.train()
@@ -370,15 +501,21 @@ def _delome_condense_task(x, edge_index, train_ids, labels, classes, budget,
             ids_t = torch.tensor(ids_c, dtype=torch.long, device=device)
 
             sgc.zero_grad()
-            logits_real = sgc(x_dev, edge_dev)
-            loss_real = F.cross_entropy(logits_real[ids_t], labels_dev[ids_t])
+            logits_real_full = sgc(x_dev, edge_dev, pre_agg=real_pre_agg)
+            logits_real = logits_real_full[ids_t][:, seen_cls_tensor]
+            target_real = label_to_col[labels_dev[ids_t]]
+            loss_real = F.nll_loss(F.log_softmax(logits_real, dim=1),
+                                   target_real)
             gw_real = torch.autograd.grad(loss_real, sgc_params)
             gw_real = [g.detach().clone() for g in gw_real]
 
             s, e = syn_class_ranges[c]
-            logits_syn = sgc(feat_syn, self_loop_edge, num_nodes=n_syn)
-            loss_syn = F.cross_entropy(logits_syn[s:e], labels_syn[s:e])
-            gw_syn = torch.autograd.grad(loss_syn, sgc_params, create_graph=True)
+            logits_syn_full = sgc(feat_syn, self_loop_edge, num_nodes=n_syn)
+            logits_syn = logits_syn_full[s:e][:, seen_cls_tensor]
+            target_syn = label_to_col[labels_syn[s:e]]
+            loss_syn = F.nll_loss(F.log_softmax(logits_syn, dim=1), target_syn)
+            gw_syn = torch.autograd.grad(loss_syn, sgc_params,
+                                         create_graph=True)
 
             coeff = n_syn_per_cls[c] / max(n_syn_per_cls.values())
             loss_match = coeff * _grad_match_loss(gw_syn, gw_real)
@@ -387,11 +524,17 @@ def _delome_condense_task(x, edge_index, train_ids, labels, classes, budget,
             loss_match.backward()
             opt_feat.step()
 
+        # Release the randomly-initialised probe before the next iteration
+        # so its parameters/grad buffers don't accumulate in GPU memory.
+        del sgc, sgc_params
+
+    del real_pre_agg, x_dev, edge_dev
     return feat_syn.detach(), labels_syn
 
 
 def _grad_match_loss(gw_syn, gw_real):
-    """MSE distance between synthetic and real gradients."""
+    """MSE distance between synthetic and real gradients (``dis_metric='mse'``
+    branch of ``gcondfunc.match_loss`` in the original DeLoMe code)."""
     vec_real = torch.cat([g.reshape(-1) for g in gw_real])
     vec_syn = torch.cat([g.reshape(-1) for g in gw_syn])
     return torch.sum((vec_syn - vec_real) ** 2)
@@ -445,17 +588,33 @@ class BaselineCL:
         self.cat_emb_dim = cfg.get('cat_emb_dim', 128)
         self.cat_n_layers = cfg.get('cat_n_layers', 2)
         self.cat_hop = cfg.get('cat_hop', 1)
+        self.cat_activation = cfg.get('cat_activation', True)
+        # cat_tim: if True, reproduces CaT paper's "Train In Memory" setting --
+        # every session's training uses ONLY condensed memory (current + past),
+        # never touching the real-graph nodes. Defaults to False (non-TIM mode,
+        # equivalent to replay_graphs = memory_bank[:k] + [tasks[k]] in original).
+        self.cat_tim = cfg.get('cat_tim', False)
         self.cosine_T = cfg.get('cosine_T', 16.0)
         self.teen_T = cfg.get('teen_T', 16.0)
         self.teen_softmax_t = cfg.get('teen_softmax_t', 20.0)
         self.teen_shift_weight = cfg.get('teen_shift_weight', 0.1)
         self.delome_budget = cfg.get('delome_budget', 60)
         self.delome_tro = cfg.get('delome_tro', 1.0)
-        self.delome_condense_epochs = cfg.get('delome_condense_epochs', 600)
+        # Original DeLoMe hard-codes 900 epochs; default here matches that.
+        self.delome_condense_epochs = cfg.get('delome_condense_epochs', 900)
         self.delome_feat_lr = cfg.get('delome_feat_lr', 1e-4)
         self.delome_sgc_k = cfg.get('delome_sgc_k', 2)
+        # Original SGC has configurable h_dims (default 1 hidden layer of 256)
+        # with LeakyReLU(0.2). Backward-compat: if user only set
+        # `delome_hidden_dim` we still honour it as a single hidden dim.
         self.delome_hidden_dim = cfg.get('delome_hidden_dim', 256)
+        self.delome_sgc_h_dims = cfg.get(
+            'delome_sgc_h_dims', [self.delome_hidden_dim])
+        self.delome_sgc_bn = cfg.get('delome_sgc_bn', False)
+        self.delome_sgc_dropout = cfg.get('delome_sgc_dropout', 0.0)
+        self.delome_sgc_linear_bias = cfg.get('delome_sgc_linear_bias', True)
         self.delome_cls_balance = cfg.get('delome_cls_balance', 'logita')
+        self.delome_condense_seed = cfg.get('delome_condense_seed', 42)
 
     def _create_model(self):
         return GCNBackbone(
@@ -518,11 +677,11 @@ class BaselineCL:
                 self._train_session(net, opt, session_id, subgraph, train_idx,
                                     all_classes, state)
 
-            # Isolated Tests
-            print(f"\n--- Isolated Tests (Session {session_id}) ---")
+            # Per-Task Tests on the cumulative subgraph (CGLB)
+            print(f"\n--- Per-Task Tests (Session {session_id}) ---")
+            eval_subgraph = self.task_loader.subgraph_per_task[session_id]
             acc_row = []
             for tid in range(session_id + 1):
-                iso_subgraph = self.task_loader.subgraph_isolated[tid]
                 test_idx = self.task_loader.test_idx_per_task[tid]
                 task_classes = self.task_loader.class_splits[tid]
 
@@ -530,7 +689,7 @@ class BaselineCL:
                     acc_row.append(0.0)
                     continue
 
-                res = self._evaluate(net, iso_subgraph, test_idx, state=state)
+                res = self._evaluate(net, eval_subgraph, test_idx, state=state)
                 acc_row.append(res['acc'])
                 print(f"  Task {tid} (classes {task_classes}): "
                       f"Acc={res['acc']:.4f} ({res['correct']}/{res['total']})")
@@ -552,7 +711,8 @@ class BaselineCL:
         print(f"\n{'='*60}")
         print(f"[{self.method.upper()}] FINAL RESULTS")
         print(f"{'='*60}")
-        self._print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        print_cl_matrix("CL Accuracy Matrix", acc_matrix, num_sessions)
+        ap_history, af, final_ap = compute_ap_af(acc_matrix)
         print(f"\nJoint Accuracy (micro): " + ", ".join(
             [f"S{i}={joint_acc_history[i]:.4f}" for i in range(num_sessions)]))
         print(f"Joint Accuracy (macro): " + ", ".join(
@@ -562,6 +722,9 @@ class BaselineCL:
             'acc_matrix': acc_matrix,
             'joint_acc': joint_acc_history,
             'joint_macro_acc': joint_macro_history,
+            'ap_history': ap_history,
+            'af': af,
+            'final_ap': final_ap,
         }
 
     # ==================== State Init ====================
@@ -634,6 +797,48 @@ class BaselineCL:
             updated = (1 - self.teen_shift_weight) * cur_protos + self.teen_shift_weight * delta
             fc.weight.data[class_src:class_dst] = updated
 
+    # ==================== Condensation helpers ====================
+
+    def _build_isolated_local_subgraph(self, session_id, train_idx):
+        """Build a task-isolated local subgraph for CaT/DeLoMe condensation.
+
+        This matches the original CaT/DeLoMe settings where condensation
+        operates on the current task's *own* nodes and edges only (no
+        historical-task neighbours leaking through propagation). It also
+        shrinks peak GPU memory: instead of holding the cumulative union
+        subgraph, we only keep the current-task subgraph locally indexed.
+
+        Returns ``(local_x, local_edge_index, local_train_ids, local_labels)``
+        where tensors live on CPU (the callee moves them to device).
+        """
+        iso = self.task_loader.subgraph_isolated[session_id]
+        sub_all_nodes = iso['all_nodes']
+        global_to_local = {g: l for l, g in enumerate(sub_all_nodes)}
+
+        sub_nodes_t = torch.tensor(sub_all_nodes, dtype=torch.long)
+        local_x = iso['x'][sub_nodes_t]
+        local_labels = iso['y'][sub_nodes_t]
+
+        src, dst = iso['edge_index']
+        # edge_index may contain global ids outside the local node set only
+        # if the subgraph builder keeps cross-task self-loops; we filter.
+        kept_mask = torch.tensor(
+            [s.item() in global_to_local and d.item() in global_to_local
+             for s, d in zip(src, dst)],
+            dtype=torch.bool,
+        )
+        src_kept = src[kept_mask]
+        dst_kept = dst[kept_mask]
+        local_src = torch.tensor(
+            [global_to_local[s.item()] for s in src_kept], dtype=torch.long)
+        local_dst = torch.tensor(
+            [global_to_local[d.item()] for d in dst_kept], dtype=torch.long)
+        local_edge_index = torch.stack([local_src, local_dst], dim=0)
+
+        local_train_ids = [global_to_local[n] for n in train_idx
+                           if n in global_to_local]
+        return local_x, local_edge_index, local_train_ids, local_labels
+
     # ==================== Training ====================
 
     def _train_session(self, net, opt, session_id, subgraph, train_idx,
@@ -659,6 +864,53 @@ class BaselineCL:
                 loss.backward()
                 opt.step()
             return
+
+        # ---- CaT TIM (Train In Memory) mode ----
+        # Faithful to the original CaT ``--tim`` flag in ``train.py``:
+        # ``replayed_graphs = memory_bank[:k+1]``. The current task's memory
+        # is condensed up-front (equivalent to calling ``observer()`` for
+        # just this task inside the original flow) and training then uses
+        # *only* condensed nodes -- no real-graph forward pass at all.
+        if self.method == 'cat' and self.cat_tim:
+            task_classes = self.task_loader.class_splits[session_id]
+            local_x, local_edge_index, local_train_ids, local_labels = \
+                self._build_isolated_local_subgraph(session_id, train_idx)
+            feat_cond, labels_cond = _cat_condense_task(
+                local_x, local_edge_index, local_train_ids, local_labels,
+                task_classes, self.cat_budget,
+                n_encoders=self.cat_n_encoders,
+                feat_lr=self.cat_feat_lr,
+                hid_dim=self.cat_hid_dim,
+                emb_dim=self.cat_emb_dim,
+                n_layers=self.cat_n_layers,
+                hop=self.cat_hop,
+                activation=self.cat_activation,
+                device=self.device,
+            )
+            state['memory_bank'].append({
+                'feat': feat_cond,
+                'labels': labels_cond,
+            })
+            state['_cat_preconsensed_session'] = session_id
+            print(f"  [CaT/TIM] Condensed task {session_id}: "
+                  f"{feat_cond.size(0)} synthetic nodes for classes {task_classes}")
+
+            net.train()
+            for epoch in range(self.epochs):
+                opt.zero_grad()
+                all_feat = torch.cat(
+                    [m['feat'] for m in state['memory_bank']], dim=0)
+                all_lab = torch.cat(
+                    [m['labels'] for m in state['memory_bank']], dim=0)
+                n_cond = all_feat.size(0)
+                self_loops = torch.arange(
+                    n_cond, device=self.device).unsqueeze(0).repeat(2, 1)
+                logits = net(all_feat, self_loops)
+                loss = F.cross_entropy(logits, all_lab)
+                loss.backward()
+                opt.step()
+            return
+
             
         if self.method == 'joint':
             all_train_idx = []
@@ -678,6 +930,61 @@ class BaselineCL:
                 prev_logits = prev_model(x, edge_index)
         else:
             prev_logits = None
+
+        # ---- DeLoMe per-session setup ----
+        # Emulates the ``if t != self.current_task:`` entry block in the
+        # original ``DeLoMe_model.observe`` / ``observe_task_IL``. Done once
+        # per session so all epochs share the same seen-class slice and
+        # logit-adjustment vector. Seen classes are the union of class ids
+        # up to and including the current task; the slice + label remap is
+        # the non-contiguous generalisation of ``[offset1:offset2]`` with
+        # ``classifier_increase=True``.
+        if self.method == 'delome':
+            seen_classes_sorted = sorted(set(
+                c for sid in range(session_id + 1)
+                for c in self.task_loader.class_splits[sid]
+            ))
+            seen_cls_tensor = torch.tensor(
+                seen_classes_sorted, dtype=torch.long, device=self.device)
+            label_to_col = torch.full(
+                (self.num_classes,), -1, dtype=torch.long, device=self.device)
+            for _i, _c in enumerate(seen_classes_sorted):
+                label_to_col[_c] = _i
+
+            adj_seen = None
+            if self.delome_cls_balance == 'logita':
+                task_classes_cur = self.task_loader.class_splits[session_id]
+                cur_train_counts = {}
+                for _c in task_classes_cur:
+                    _c_ids = [n for n in train_idx if n in all_nodes_set
+                              and labels[n].item() == _c]
+                    cur_train_counts[_c] = len(_c_ids)
+
+                freq_list = []
+                for sid in range(session_id + 1):
+                    for _c in self.task_loader.class_splits[sid]:
+                        if sid < session_id:
+                            freq_list.append(state['cond_num'].get(_c, 1))
+                        else:
+                            freq_list.append(cur_train_counts.get(_c, 1))
+                freq_arr = np.array(freq_list, dtype=np.float64)
+                _s = freq_arr.sum()
+                if _s > 0:
+                    freq_arr = freq_arr / _s
+                adj_vals = np.log(freq_arr ** self.delome_tro + 1e-12)
+
+                full_adj = torch.zeros(self.num_classes, device=self.device)
+                all_seen_flat = [c for sid in range(session_id + 1)
+                                 for c in self.task_loader.class_splits[sid]]
+                for _i, _c in enumerate(all_seen_flat):
+                    if _c < self.num_classes:
+                        full_adj[_c] = adj_vals[_i]
+                adj_seen = full_adj[seen_cls_tensor]
+
+            state['seen_cls_tensor'] = seen_cls_tensor
+            state['label_to_col'] = label_to_col
+            state['adj_seen'] = adj_seen
+            state['adjustments'] = adj_seen  # kept for backward-compat access
 
         net.train()
         for epoch in range(self.epochs):
@@ -765,9 +1072,20 @@ class BaselineCL:
                 loss = loss + loss_replay
 
             elif self.method == 'delome':
-                if state['adjustments'] is not None:
-                    loss = F.cross_entropy(
-                        logits[train_ids] + state['adjustments'], labels[train_ids])
+                # Slice logits to seen classes (emulates classifier_increase
+                # + [offset1:offset2] in the original DeLoMe code) and remap
+                # the labels into that slice; optionally add the per-class
+                # logit-adjustment bias. Overrides the default full-class CE
+                # computed above.
+                _slice = state['seen_cls_tensor']
+                _remap = state['label_to_col']
+                _adj = state['adj_seen']
+                logits_sliced = logits[train_ids][:, _slice]
+                target_sliced = _remap[labels[train_ids]]
+                if _adj is not None:
+                    loss = F.cross_entropy(logits_sliced + _adj, target_sliced)
+                else:
+                    loss = F.cross_entropy(logits_sliced, target_sliced)
                 if session_id > 0 and len(state['memory_bank']) > 0:
                     for mem in state['memory_bank']:
                         mem_feat = mem['feat']
@@ -775,11 +1093,14 @@ class BaselineCL:
                         n_mem = mem_feat.size(0)
                         sl = torch.arange(n_mem, device=self.device).unsqueeze(0).repeat(2, 1)
                         mem_logits = net(mem_feat, sl)
-                        if state['adjustments'] is not None:
+                        mem_logits_sliced = mem_logits[:, _slice]
+                        mem_target_sliced = _remap[mem_lab]
+                        if _adj is not None:
                             loss_aux = F.cross_entropy(
-                                mem_logits + state['adjustments'], mem_lab)
+                                mem_logits_sliced + _adj, mem_target_sliced)
                         else:
-                            loss_aux = F.cross_entropy(mem_logits, mem_lab)
+                            loss_aux = F.cross_entropy(
+                                mem_logits_sliced, mem_target_sliced)
                         loss = loss + loss_aux
 
             loss.backward()
@@ -892,22 +1213,13 @@ class BaselineCL:
                     p.requires_grad = False
                     
         elif self.method == 'cat':
+            # In TIM mode the current task was already condensed at the
+            # start of ``_train_session``; skip to avoid double-appending.
+            if state.get('_cat_preconsensed_session') == session_id:
+                return
             task_classes = self.task_loader.class_splits[session_id]
-            sub_all_nodes = subgraph['all_nodes']
-            global_to_local = {g: l for l, g in enumerate(sub_all_nodes)}
-
-            local_x = x[sub_all_nodes]
-            local_labels = labels[sub_all_nodes]
-
-            src, dst = subgraph['edge_index']
-            local_src = torch.tensor([global_to_local[s.item()] for s in src],
-                                     dtype=torch.long)
-            local_dst = torch.tensor([global_to_local[d.item()] for d in dst],
-                                     dtype=torch.long)
-            local_edge_index = torch.stack([local_src, local_dst], dim=0)
-
-            local_train_ids = [global_to_local[n] for n in train_idx
-                               if n in global_to_local]
+            local_x, local_edge_index, local_train_ids, local_labels = \
+                self._build_isolated_local_subgraph(session_id, train_idx)
 
             feat_cond, labels_cond = _cat_condense_task(
                 local_x, local_edge_index, local_train_ids, local_labels,
@@ -918,6 +1230,7 @@ class BaselineCL:
                 emb_dim=self.cat_emb_dim,
                 n_layers=self.cat_n_layers,
                 hop=self.cat_hop,
+                activation=self.cat_activation,
                 device=self.device,
             )
             state['memory_bank'].append({
@@ -929,30 +1242,26 @@ class BaselineCL:
 
         elif self.method == 'delome':
             task_classes = self.task_loader.class_splits[session_id]
-            sub_all_nodes = subgraph['all_nodes']
-            global_to_local = {g: l for l, g in enumerate(sub_all_nodes)}
+            seen_classes = sorted(set(
+                c for sid in range(session_id + 1)
+                for c in self.task_loader.class_splits[sid]
+            ))
 
-            local_x = x[sub_all_nodes]
-            local_labels = labels[sub_all_nodes]
-
-            src, dst = subgraph['edge_index']
-            local_src = torch.tensor([global_to_local[s.item()] for s in src],
-                                     dtype=torch.long)
-            local_dst = torch.tensor([global_to_local[d.item()] for d in dst],
-                                     dtype=torch.long)
-            local_edge_index = torch.stack([local_src, local_dst], dim=0)
-
-            local_train_ids = [global_to_local[n] for n in train_idx
-                               if n in global_to_local]
+            local_x, local_edge_index, local_train_ids, local_labels = \
+                self._build_isolated_local_subgraph(session_id, train_idx)
 
             feat_cond, labels_cond = _delome_condense_task(
                 local_x, local_edge_index, local_train_ids, local_labels,
-                task_classes, self.delome_budget,
+                task_classes, seen_classes, self.delome_budget,
                 num_all_classes=self.num_classes,
-                hidden_dim=self.delome_hidden_dim,
+                h_dims=tuple(self.delome_sgc_h_dims),
                 sgc_k=self.delome_sgc_k,
+                sgc_bn=self.delome_sgc_bn,
+                sgc_dropout=self.delome_sgc_dropout,
+                sgc_linear_bias=self.delome_sgc_linear_bias,
                 condense_epochs=self.delome_condense_epochs,
                 feat_lr=self.delome_feat_lr,
+                seed=self.delome_condense_seed,
                 device=self.device,
             )
             state['memory_bank'].append({
@@ -962,38 +1271,14 @@ class BaselineCL:
             print(f"  [DeLoMe] Condensed task {session_id}: "
                   f"{feat_cond.size(0)} synthetic nodes for classes {task_classes}")
 
+            # Update condensed-class counts. Adjustments themselves are
+            # recomputed at the start of the NEXT session's ``_train_session``
+            # (see its DeLoMe setup block), which mirrors the original's
+            # ``if t != self.current_task:`` entry logic.
             for c in task_classes:
                 c_count = (labels_cond == c).sum().item()
                 if c_count > 0:
                     state['cond_num'][c] = c_count
-
-            if self.delome_cls_balance == 'logita':
-                all_nodes_set = set(sub_all_nodes)
-                current_counts = []
-                for c in task_classes:
-                    c_ids = [n for n in train_idx if n in all_nodes_set
-                             and labels[n].item() == c]
-                    current_counts.append(len(c_ids))
-
-                freq_list = []
-                for sid in range(session_id + 1):
-                    for c in self.task_loader.class_splits[sid]:
-                        if sid < session_id:
-                            freq_list.append(state['cond_num'].get(c, 1))
-                        else:
-                            idx_in_task = task_classes.index(c)
-                            freq_list.append(current_counts[idx_in_task])
-                freq_arr = np.array(freq_list, dtype=np.float64)
-                freq_arr = freq_arr / freq_arr.sum()
-                adj_vals = np.log(freq_arr ** self.delome_tro + 1e-12)
-                full_adj = torch.zeros(self.num_classes, device=self.device)
-                all_seen = []
-                for sid in range(session_id + 1):
-                    all_seen.extend(self.task_loader.class_splits[sid])
-                for i, c in enumerate(all_seen):
-                    if c < self.num_classes:
-                        full_adj[c] = adj_vals[i]
-                state['adjustments'] = full_adj
 
     # ==================== Evaluation ====================
 
@@ -1050,20 +1335,3 @@ class BaselineCL:
             'correct': correct, 'total': total,
         }
 
-    # ==================== Printing ====================
-
-    @staticmethod
-    def _print_cl_matrix(title, matrix, num_sessions):
-        print(f"\n{title}:")
-        header = "Session | " + " | ".join(
-            [f"Task {i:5d}" for i in range(num_sessions)])
-        print(header)
-        print("-" * len(header))
-        for sid, row in enumerate(matrix):
-            parts = []
-            for tid in range(num_sessions):
-                if tid < len(row):
-                    parts.append(f"{row[tid]:.4f} ")
-                else:
-                    parts.append("       ")
-            print(f"   {sid}    | " + " | ".join(parts))

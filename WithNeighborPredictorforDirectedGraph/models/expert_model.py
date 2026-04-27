@@ -275,23 +275,24 @@ class DirectedExpertCL:
         return total_loss / num_samples if num_samples > 0 else 0.0
 
     def out_neighbor_prediction_loss(self, x, gcn_embed, directed_ei,
-                                     target_nodes, all_nodes, expert_id):
+                                     train_nodes, expert_id):
         """
         Compute out-neighbor prediction loss.
 
-        Positive: A->B where A is target class node
-        Negative: random (A, B') where A->B' does NOT exist, A is target
+        Positive: A->B where both A and B are in train_nodes
+        Negative: random (A, B') where A->B' does NOT exist, both in train_nodes
         """
         predictor = self.model.experts[expert_id].out_predictor
         device = x.device
 
         src, dst = directed_ei[0], directed_ei[1]
 
-        # Positive edges: A->B where A in target_nodes
-        target_tensor = torch.tensor(sorted(target_nodes), device=device)
-        src_is_target = torch.isin(src, target_tensor)
-        pos_src = src[src_is_target]
-        pos_dst = dst[src_is_target]
+        train_tensor = torch.tensor(sorted(train_nodes), device=device)
+        src_in_train = torch.isin(src, train_tensor)
+        dst_in_train = torch.isin(dst, train_tensor)
+        both_in_train = src_in_train & dst_in_train
+        pos_src = src[both_in_train]
+        pos_dst = dst[both_in_train]
 
         num_pos = pos_src.size(0)
         if num_pos == 0:
@@ -302,18 +303,17 @@ class DirectedExpertCL:
         h_other = predictor.forward_other(x[pos_dst])
         pos_scores = (h_main * h_other).sum(dim=1)
 
-        # Negative sampling
+        # Negative sampling: both endpoints from train_nodes
         num_neg = num_pos * self.num_neg_samples
         max_id = x.size(0)
         pos_keys = pos_src.long() * max_id + pos_dst.long()
 
-        all_nodes_tensor = torch.tensor(all_nodes, device=device)
         oversample = int(num_neg * 1.5) + 100
 
-        neg_A_idx = torch.randint(0, len(target_tensor), (oversample,), device=device)
-        neg_B_idx = torch.randint(0, len(all_nodes_tensor), (oversample,), device=device)
-        neg_A = target_tensor[neg_A_idx]
-        neg_B = all_nodes_tensor[neg_B_idx]
+        neg_A_idx = torch.randint(0, len(train_tensor), (oversample,), device=device)
+        neg_B_idx = torch.randint(0, len(train_tensor), (oversample,), device=device)
+        neg_A = train_tensor[neg_A_idx]
+        neg_B = train_tensor[neg_B_idx]
 
         # Filter: no self-loops, no positive edges
         neg_keys = neg_A.long() * max_id + neg_B.long()
@@ -337,23 +337,24 @@ class DirectedExpertCL:
         return pos_loss + neg_loss
 
     def in_neighbor_prediction_loss(self, x, gcn_embed, directed_ei,
-                                    target_nodes, all_nodes, expert_id):
+                                    train_nodes, expert_id):
         """
         Compute in-neighbor prediction loss.
 
-        Positive: B->A where A is target class node
-        Negative: random (A, B') where B'->A does NOT exist, A is target
+        Positive: B->A where both A and B are in train_nodes
+        Negative: random (A, B') where B'->A does NOT exist, both in train_nodes
         """
         predictor = self.model.experts[expert_id].in_predictor
         device = x.device
 
         src, dst = directed_ei[0], directed_ei[1]
 
-        # Positive edges: B->A where A in target_nodes (dst is target)
-        target_tensor = torch.tensor(sorted(target_nodes), device=device)
-        dst_is_target = torch.isin(dst, target_tensor)
-        pos_B = src[dst_is_target]  # departure point
-        pos_A = dst[dst_is_target]  # arrival point (main node)
+        train_tensor = torch.tensor(sorted(train_nodes), device=device)
+        src_in_train = torch.isin(src, train_tensor)
+        dst_in_train = torch.isin(dst, train_tensor)
+        both_in_train = src_in_train & dst_in_train
+        pos_B = src[both_in_train]  # departure point
+        pos_A = dst[both_in_train]  # arrival point (main node)
 
         num_pos = pos_A.size(0)
         if num_pos == 0:
@@ -364,19 +365,17 @@ class DirectedExpertCL:
         h_other = predictor.forward_other(x[pos_B])
         pos_scores = (h_main * h_other).sum(dim=1)
 
-        # Negative sampling: (A, B') where B'->A does NOT exist
+        # Negative sampling: both endpoints from train_nodes
         num_neg = num_pos * self.num_neg_samples
         max_id = x.size(0)
-        # Key: (A, B) represents "B is an in-neighbor of A"
         pos_keys = pos_A.long() * max_id + pos_B.long()
 
-        all_nodes_tensor = torch.tensor(all_nodes, device=device)
         oversample = int(num_neg * 1.5) + 100
 
-        neg_A_idx = torch.randint(0, len(target_tensor), (oversample,), device=device)
-        neg_B_idx = torch.randint(0, len(all_nodes_tensor), (oversample,), device=device)
-        neg_A = target_tensor[neg_A_idx]
-        neg_B_prime = all_nodes_tensor[neg_B_idx]
+        neg_A_idx = torch.randint(0, len(train_tensor), (oversample,), device=device)
+        neg_B_idx = torch.randint(0, len(train_tensor), (oversample,), device=device)
+        neg_A = train_tensor[neg_A_idx]
+        neg_B_prime = train_tensor[neg_B_idx]
 
         # Filter: no self-loops, no positive edges
         neg_keys = neg_A.long() * max_id + neg_B_prime.long()
@@ -399,38 +398,36 @@ class DirectedExpertCL:
 
         return pos_loss + neg_loss
 
-    def train_out_neighbor_epoch(self, session_id, subgraph, gcn_embed, optimizer):
-        """Train out-predictor for one epoch."""
+    def train_out_neighbor_epoch(self, session_id, subgraph, gcn_embed,
+                                 optimizer, train_nodes):
+        """Train out-predictor for one epoch using only train_nodes."""
         self.model.train()
         expert_id = session_id % self.num_experts
 
         x = subgraph['x'].to(self.device)
         directed_ei = subgraph['directed_edge_index'].to(self.device)
-        target_nodes = set(subgraph['target_nodes'])
-        all_nodes = subgraph['all_nodes']
 
         optimizer.zero_grad()
         loss = self.out_neighbor_prediction_loss(
-            x, gcn_embed, directed_ei, target_nodes, all_nodes, expert_id
+            x, gcn_embed, directed_ei, train_nodes, expert_id
         )
         loss.backward()
         optimizer.step()
 
         return loss.item()
 
-    def train_in_neighbor_epoch(self, session_id, subgraph, gcn_embed, optimizer):
-        """Train in-predictor for one epoch."""
+    def train_in_neighbor_epoch(self, session_id, subgraph, gcn_embed,
+                                optimizer, train_nodes):
+        """Train in-predictor for one epoch using only train_nodes."""
         self.model.train()
         expert_id = session_id % self.num_experts
 
         x = subgraph['x'].to(self.device)
         directed_ei = subgraph['directed_edge_index'].to(self.device)
-        target_nodes = set(subgraph['target_nodes'])
-        all_nodes = subgraph['all_nodes']
 
         optimizer.zero_grad()
         loss = self.in_neighbor_prediction_loss(
-            x, gcn_embed, directed_ei, target_nodes, all_nodes, expert_id
+            x, gcn_embed, directed_ei, train_nodes, expert_id
         )
         loss.backward()
         optimizer.step()
@@ -766,6 +763,7 @@ class DirectedExpertCL:
              test_loader_iso, test_loader_joint) = self.task_loader.get_task(session_id)
 
             expert_id = session_id % self.num_experts
+            train_nodes = set(self.task_loader.train_idx_per_task[session_id])
 
             print(f"\n{'='*60}")
             print(f"Session {session_id}: Classes {curr_classes}")
@@ -837,7 +835,7 @@ class DirectedExpertCL:
                         desc=f"Session {session_id} - Out-Predictor")
             for epoch in pbar:
                 loss = self.train_out_neighbor_epoch(
-                    session_id, subgraph, gcn_embed, optimizer
+                    session_id, subgraph, gcn_embed, optimizer, train_nodes
                 )
 
                 if epoch > 0 and epoch % self.config['valid_epoch'] == 0:
@@ -878,7 +876,7 @@ class DirectedExpertCL:
                         desc=f"Session {session_id} - In-Predictor")
             for epoch in pbar:
                 loss = self.train_in_neighbor_epoch(
-                    session_id, subgraph, gcn_embed, optimizer
+                    session_id, subgraph, gcn_embed, optimizer, train_nodes
                 )
 
                 if epoch > 0 and epoch % self.config['valid_epoch'] == 0:

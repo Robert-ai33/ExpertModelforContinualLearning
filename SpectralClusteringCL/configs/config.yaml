@@ -6,14 +6,14 @@ default:
   seed: [0, 1, 2, 3, 4]
 
   # Expert Parameters
-  num_experts: 6  # 最大专家数量
+  num_experts: 7  # 最大专家数量
 
   # MLP Architecture
   hidden_dim: 256
 
   # Training epochs (per model per session)
   neighbor_epochs: 500        # 邻居预测器训练epochs
-  cross_class_epochs: 500     # 跨类别邻居预测器训练epochs
+  cross_class_epochs: 1000     # 跨类别邻居预测器训练epochs
 
   # Training hyperparameters
   lr: 1e-3
