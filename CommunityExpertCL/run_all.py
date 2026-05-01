@@ -26,7 +26,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from data import GraphDataset, TaskLoader
-from models import LiteExpertCL, BaselineCL, SEEDCL, MAERoutingOnlyCL, ACILCL, TEMCL
+from models import (
+    LiteExpertCL, BaselineCL, SEEDCL, MAERoutingOnlyCL, ACILCL, TEMCL,
+    DINGLECL,
+)
 from utils import seed_everything, compute_ap_af
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -35,9 +38,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from main import EXP_SETTINGS
 
 ALL_METHODS = ['bare', 'ewc', 'mas', 'twp', 'lwf', 'gem', 'ergnn', 'cat',
-               'cosine', 'teen', 'delome', 'seed', 'acil', 'tem', 'joint',
-               'mae_routing', 'lite']
-STANDALONE_METHODS = {'lite', 'seed', 'mae_routing', 'acil', 'tem'}
+               'cosine', 'teen', 'delome', 'seed', 'acil', 'tem', 'dingle',
+               'joint', 'mae_routing', 'lite']
+STANDALONE_METHODS = {'lite', 'seed', 'mae_routing', 'acil', 'tem', 'dingle'}
 SUPPORTED_RUN_METHODS = [m for m in ALL_METHODS
                         if m in STANDALONE_METHODS or m in BaselineCL.METHODS]
 METHOD_LABELS = {
@@ -47,6 +50,7 @@ METHOD_LABELS = {
     'cosine': 'COSINE', 'teen': 'TEEN',
     'delome': 'DeLoMe', 'seed': 'SEED',
     'acil': 'ACIL', 'tem': 'TEM',
+    'dingle': 'DINGLE',
     'joint': 'JOINT', 'lite': 'Ours',
     'mae_routing': 'Manifold_MAE',
 }
@@ -57,6 +61,7 @@ METHOD_MARKERS = {
     'cosine': 'p', 'teen': 'h',
     'delome': '>', 'seed': '8',
     'acil': '+', 'tem': '2',
+    'dingle': '3',
     'joint': '<', 'lite': 'd',
     'mae_routing': '1',
 }
@@ -87,6 +92,9 @@ def run_single_method(method, task_loader, configs, device, ntrials, seeds):
         elif method == 'tem':
             model = TEMCL(
                 task_loader=task_loader, config=configs['tem'], device=device)
+        elif method == 'dingle':
+            model = DINGLECL(
+                task_loader=task_loader, config=configs['dingle'], device=device)
         elif method == 'seed':
             model = SEEDCL(
                 task_loader=task_loader, config=configs['baseline'],
@@ -270,6 +278,7 @@ def main():
         'mae_routing': 'config_mae_routing.yaml',
         'acil': 'config_acil.yaml',
         'tem': 'config_tem.yaml',
+        'dingle': 'config_dingle.yaml',
     }
     configs = {}
     for key, fname in cfg_files.items():
