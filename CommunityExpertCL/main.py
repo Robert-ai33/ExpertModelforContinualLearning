@@ -13,10 +13,13 @@ import numpy as np
 
 import torch
 
-from data import GraphDataset, TaskLoader
+from data import (
+    GraphDataset, TaskLoader,
+    TextGraphDataset, TextTaskLoader, SUPPORTED_TEXT_DATASETS,
+)
 from models import (
     LiteExpertCL, BaselineCL, SEEDCL, MAERoutingOnlyCL, ACILCL, TEMCL,
-    DINGLECL,
+    DINGLECL, SimGCLBaseline,
 )
 from utils import seed_everything
 
@@ -89,11 +92,15 @@ def main():
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--method', type=str, default='lite',
                         choices=['lite', 'seed', 'mae_routing', 'acil', 'tem',
-                                 'dingle']
+                                 'dingle', 'simgcl']
                                 + BaselineCL.METHODS,
                         help='CL method to run (default: lite)')
     parser.add_argument('--svd_dim', type=int, default=0,
                         help='Truncated SVD target dim (0 = disabled)')
+    parser.add_argument('--lm', type=str, default=None,
+                        choices=['llama-1b', 'llama-3b'],
+                        help='LM backbone for --method simgcl '
+                             '(overrides config; default: llama-1b via config)')
     args = parser.parse_args()
 
     # Load config
@@ -107,6 +114,8 @@ def main():
         config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_tem.yaml')
     elif args.method == 'dingle':
         config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_dingle.yaml')
+    elif args.method == 'simgcl':
+        config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_simgcl.yaml')
     else:
         # SEED and all other baselines share config_baseline.yaml
         config_path = os.path.join(os.path.dirname(__file__), 'configs', 'config_baseline.yaml')
@@ -121,12 +130,28 @@ def main():
     config['split_t'] = exp.get('split_t', config.get('split_t', 3))
     config['split_v'] = exp.get('split_v', config.get('split_v', 1))
 
+    # SimGCL-only: validate text availability and resolve --lm override
+    if args.method == 'simgcl':
+        if args.dataset not in SUPPORTED_TEXT_DATASETS:
+            raise ValueError(
+                f"--method simgcl requires a text-attributed dataset, "
+                f"but '{args.dataset}' has no raw text release. "
+                f"Datasets without text (coauthor-cs, amazon-computers, "
+                f"cora-full) are not supported by LLM-based baselines. "
+                f"Supported: {sorted(SUPPORTED_TEXT_DATASETS)}"
+            )
+        if args.lm is not None:
+            config['lm'] = args.lm
+        config['dataset'] = args.dataset
+
     # Device
     device = torch.device(
         f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     )
     print(f"Device: {device}")
     print(f"Method: {args.method}")
+    if args.method == 'simgcl':
+        print(f"LM backbone: {config['lm']}")
     print(f"Dataset: {args.dataset}")
     print(f"Class splits: {config['class_splits']}")
     print(f"Split ratio: t/S={config['split_t']}/{config['split_S']}, "
@@ -151,17 +176,27 @@ def main():
 
         seed_everything(seed)
 
-        graph_dataset = GraphDataset(args.dataset, args.data_path,
-                                     svd_dim=args.svd_dim)
-
-        task_loader = TaskLoader(
-            batch_size=config.get('batch_size', 256),
-            graph_dataset=graph_dataset,
-            class_splits=config['class_splits'],
-            split_S=config['split_S'],
-            split_t=config['split_t'],
-            split_v=config['split_v'],
-        )
+        if args.method == 'simgcl':
+            graph_dataset = TextGraphDataset(args.dataset, args.data_path)
+            task_loader = TextTaskLoader(
+                batch_size=config.get('batch_size', 5),
+                text_graph_dataset=graph_dataset,
+                class_splits=config['class_splits'],
+                split_S=config['split_S'],
+                split_t=config['split_t'],
+                split_v=config['split_v'],
+            )
+        else:
+            graph_dataset = GraphDataset(args.dataset, args.data_path,
+                                         svd_dim=args.svd_dim)
+            task_loader = TaskLoader(
+                batch_size=config.get('batch_size', 256),
+                graph_dataset=graph_dataset,
+                class_splits=config['class_splits'],
+                split_S=config['split_S'],
+                split_t=config['split_t'],
+                split_v=config['split_v'],
+            )
 
         if args.method == 'lite':
             model = LiteExpertCL(
@@ -195,6 +230,13 @@ def main():
             )
         elif args.method == 'dingle':
             model = DINGLECL(
+                task_loader=task_loader,
+                config=config,
+                device=device,
+            )
+        elif args.method == 'simgcl':
+            config['_seed'] = seed
+            model = SimGCLBaseline(
                 task_loader=task_loader,
                 config=config,
                 device=device,

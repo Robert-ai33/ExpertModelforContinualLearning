@@ -1,0 +1,53 @@
+# SimGCL (LLM4GCL port) configuration.
+#
+# Backbone 必须是 LLaMA-3.2-{1B,3B}（与原论文一致）。权重解析顺序见
+# models/lm_backbone.py 顶部 docstring：
+#   1) 优先读取 model_path 下的 ModelScope 本地快照（推荐，离线、不要 HF token）。
+#      预下载：
+#        from modelscope import snapshot_download
+#        snapshot_download('LLM-Research/Llama-3.2-1B', cache_dir='./model_cache')
+#        snapshot_download('LLM-Research/Llama-3.2-3B', cache_dir='./model_cache')
+#   2) 其次回退到 Hugging Face（meta-llama/* 是 gated，需 HF_TOKEN 且账号已通过审批）。
+#   3) 也可用环境变量 LLAMA_1B_PATH / LLAMA_3B_PATH 强制指定本地目录。
+#
+# 内存/时间排序：llama-1b < llama-3b。
+
+default:
+  # ---- LM backbone ----
+  lm: 'llama-1b'              # 'llama-1b' | 'llama-3b'
+  model_path: './model_cache/'
+
+  # ---- Seeds & training schedule ----
+  seed: [0, 1, 2, 3, 4]
+  epochs: 10
+  valid_epoch: 1
+  warmup_epochs: 1
+  lr: 2.0e-4
+  min_lr: 5.0e-6
+  grad_steps: 2
+  weight_decay: 5.0e-2
+  dropout: 0.1
+  att_dropout: 0.1
+  patience: 5
+  batch_size: 5               # 序列长 + 4-bit 量化 ≈ 4060 8GB 安全值
+
+  # ---- Sequence ----
+  max_length: 512
+  max_node_text_len: 128
+  hop: [10, 10]               # 邻居采样上限（[0]: 1-hop, [1]: 2-hop）
+  mode: 'neighbors'           # 'neighbors' | 'ego' | 'pure'
+  include_label: false        # true 时会把已知邻居标签泄漏进 prompt（不推荐）
+
+  # ---- LoRA ----
+  LoRA:
+    use_lora: true
+    lora_r: 5
+    lora_alpha: 16
+    lora_dropout: 0.05
+
+  # ---- Cosine classifier / prototype ----
+  T: 1.0                      # 温度，越大 logits 越尖
+  sample_num: 50              # update_proto 时的分层抽样上限（per-task）
+
+  # ---- Misc ----
+  checkpoint_path: './checkpoints/simgcl'
